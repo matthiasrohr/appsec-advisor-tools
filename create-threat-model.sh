@@ -89,6 +89,10 @@ RUN_QA="${RUN_QA:-1}"                             # 0 → --no-qa (faster, less 
 # must not ask someone who has already answered.
 [ -n "${SCAN_MODE:-}" ] && MODE_EXPLICIT=1 || MODE_EXPLICIT=0
 SCAN_MODE="${SCAN_MODE:-standard}"
+# Answer the questions this script asks with the option they default to, and
+# never wait for input. A run without a terminal on stdin does that anyway; the
+# flag is for a CI runner that hands its job a terminal.
+ASSUME_YES="${ASSUME_YES:-0}"                     # 1 → same as --yes
 FAIL_ON="${FAIL_ON:-}"                            # critical | high | medium → non-zero exit
 MAX_DURATION="${MAX_DURATION:-}"                  # seconds; empty = no wall-clock limit
 # Spend cap in USD, also settable per run with --max-budget. It only bites under
@@ -223,6 +227,10 @@ ask_choice() {
     case "$reply" in r|R|rebuild) return 1 ;; *) return 0 ;; esac
 }
 
+# Whether a question can be put to anybody at all: something has to be able to
+# answer it, and --yes says the answer is already known.
+interactive() { [ -t 0 ] && [ "$ASSUME_YES" = "0" ]; }
+
 # Ctrl-C reaches the whole process group, so the scan dies with it — but the
 # runner then exits with SIGPIPE (141), not SIGINT, and bash walks on into the
 # result and publish steps and pushes a report the user just aborted. Stop the
@@ -265,6 +273,9 @@ Options:
                          Unattended, each of the three takes the first option.
   --max-budget  <usd>    Stop the run when the estimated cost exceeds this
                          amount. API billing only (MAX_BUDGET sets a default).
+  -y, --yes              Answer every question with the option it defaults to
+                         and never wait for input — for CI. Without a terminal
+                         on stdin the run does this by itself.
   --verbose              Pass --verbose to the headless run: the raw hook event
                          log on stderr instead of milestone lines
   --quiet                Pass --quiet: no live progress at all
@@ -305,6 +316,7 @@ Plugin and scan:
   SESSION_MODEL=<model>   REASONING_MODEL=<tier>
   VERBOSITY=quiet|normal|verbose                   (same as --quiet / --verbose)
   SCAN_MODE=standard|rebuild|rerender             (same as --mode)
+  ASSUME_YES=1                                    (same as --yes)
   WITH_SARIF=1  WITH_THREATDRAGON=1  WITH_REQUIREMENTS=1  RUN_QA=0
   PENTEST_URL=<http(s) url>         (same as --url) Strix pentest tasks for that URL
   FAIL_ON=critical|high|medium      MAX_DURATION=<seconds>   MAX_BUDGET=<usd>
@@ -340,6 +352,7 @@ while [ $# -gt 0 ]; do
         --output-repo) OUTPUT_REPO="${2:?--output-repo needs a git URL}"; shift 2 ;;
         --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; MODE_EXPLICIT=1; shift 2 ;;
         --max-budget)  MAX_BUDGET="${2:?--max-budget needs an amount in USD}"; shift 2 ;;
+        -y|--yes)      ASSUME_YES=1; shift ;;
         --verbose)     VERBOSITY=verbose; shift ;;
         --quiet)       VERBOSITY=quiet;   shift ;;
         -h|--help)
@@ -1098,7 +1111,7 @@ if [ "$PROFILE_ONLY" = "0" ] && [ "$MODE_EXPLICIT" = "0" ]; then
     if [ "$STAGE1_RENDERABLE" = "1" ]; then
         prev_when="$(file_date "$CHECKPOINT_FILE")"
         SCAN_MODE="rerender"
-        if [ -t 0 ]; then
+        if interactive; then
             if ask_choice \
                 "a run from ${prev_when:-an earlier day} finished its analysis but never rendered a report" \
                 "render that analysis, nothing is analyzed again" \
@@ -1115,7 +1128,7 @@ if [ "$PROFILE_ONLY" = "0" ] && [ "$MODE_EXPLICIT" = "0" ]; then
         prev_when="$(file_date "$PREVIOUS_REPORT")"
         residue_note=""
         [ -f "$CHECKPOINT_FILE" ] && residue_note="a later run stopped before finishing; either choice clears what it left"
-        if [ -t 0 ]; then
+        if interactive; then
             if ask_choice \
                 "a report from ${prev_when:-an earlier run} is already here" \
                 "reassess and keep that report, its history and finding ids" \
