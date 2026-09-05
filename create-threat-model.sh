@@ -265,6 +265,9 @@ Options:
                          Unattended, each of the three takes the first option.
   --max-budget  <usd>    Stop the run when the estimated cost exceeds this
                          amount. API billing only (MAX_BUDGET sets a default).
+  --verbose              Pass --verbose to the headless run: the raw hook event
+                         log on stderr instead of milestone lines
+  --quiet                Pass --quiet: no live progress at all
   --profile-only         Print the target's size, language split and build
                          manifests, then stop. No model, no credential, no cost.
   -h, --help             This help
@@ -299,7 +302,8 @@ Plugin and scan:
       write credentials and commit identity for the report repository; kept
       separate from the target ones because writing is a different privilege
   ASSESSMENT_DEPTH=quick|standard|thorough        TRUST_MODE=untrusted|trusted
-  SESSION_MODEL=<model>   REASONING_MODEL=<tier>  VERBOSITY=quiet|normal|verbose
+  SESSION_MODEL=<model>   REASONING_MODEL=<tier>
+  VERBOSITY=quiet|normal|verbose                   (same as --quiet / --verbose)
   SCAN_MODE=standard|rebuild|rerender             (same as --mode)
   WITH_SARIF=1  WITH_THREATDRAGON=1  WITH_REQUIREMENTS=1  RUN_QA=0
   PENTEST_URL=<http(s) url>         (same as --url) Strix pentest tasks for that URL
@@ -336,6 +340,8 @@ while [ $# -gt 0 ]; do
         --output-repo) OUTPUT_REPO="${2:?--output-repo needs a git URL}"; shift 2 ;;
         --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; MODE_EXPLICIT=1; shift 2 ;;
         --max-budget)  MAX_BUDGET="${2:?--max-budget needs an amount in USD}"; shift 2 ;;
+        --verbose)     VERBOSITY=verbose; shift ;;
+        --quiet)       VERBOSITY=quiet;   shift ;;
         -h|--help)
             case "${2:-}" in
                 config|all|env) usage_config ;;
