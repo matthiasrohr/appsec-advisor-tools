@@ -74,6 +74,8 @@ REASONING_MODEL="${REASONING_MODEL:-}"            # opus | opus-cheap | sonnet |
 WITH_SARIF="${WITH_SARIF:-0}"                     # 1 → threat-model.sarif.json
 WITH_THREATDRAGON="${WITH_THREATDRAGON:-0}"       # 1 → threat-model.threatdragon.json (alpha)
 WITH_REQUIREMENTS="${WITH_REQUIREMENTS:-0}"       # 1 → run the requirements check
+WITH_PDF="${WITH_PDF:-0}"                         # 1 → threat-model.pdf (needs pandoc + weasyprint)
+WITH_HTML="${WITH_HTML:-0}"                       # 1 → threat-model.html
 # Base URL of the running instance of the target. Set it, and the run also
 # builds the Strix pentest task set for that URL; empty = no pentest tasks.
 PENTEST_URL="${PENTEST_URL:-}"                    # also settable per run with --url
@@ -132,6 +134,11 @@ KEY_FETCH_TIMEOUT="${KEY_FETCH_TIMEOUT:-60}"  # seconds allowed for fetching the
 #          stored subscription credentials itself) | 1 = always | 0 = never
 VERIFY_AUTH="${VERIFY_AUTH:-auto}"
 VERBOSITY="${VERBOSITY:-normal}"                  # quiet | normal | verbose
+# A copy of everything this script prints, in a file of your choosing. Also
+# settable per run with --console-log. The scan's own output is in run.log
+# either way; this one adds the steps around it and starts before the output
+# directory is even known.
+CONSOLE_LOG="${CONSOLE_LOG:-}"
 EXTRA_ARGS=()                                     # extra run-headless.sh flags
 
 # Business context for this run: an http(s) URL or a file path. Also settable
@@ -158,7 +165,10 @@ OUTPUT_REPO="${OUTPUT_REPO:-}"                       # git URL, https or ssh
 OUTPUT_REPO_BRANCH="${OUTPUT_REPO_BRANCH:-}"         # empty = the repo's default branch
 OUTPUT_REPO_PATH="${OUTPUT_REPO_PATH:-}"             # empty = reports/<target-slug>
 OUTPUT_REPO_PUSH="${OUTPUT_REPO_PUSH:-1}"            # 0 = commit locally, do not push
-OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat-model.sarif.json threat-model.threatdragon.json threat-model.pdf threat-model.html pentest-tasks.yaml}"
+# Names or shell globs, matched inside the output directory. The figures are
+# what threat-model.md embeds by relative path — published without them, the
+# report shows two broken images.
+OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat-model.figure*.svg threat-model.sarif.json threat-model.threatdragon.json threat-model.pdf threat-model.html pentest-tasks.yaml}"
 
 # Write credentials for OUTPUT_REPO. Deliberately separate from the target ones:
 # reading a repository and writing to one are different privileges.
@@ -273,6 +283,9 @@ Options:
                          Unattended, each of the three takes the first option.
   --max-budget  <usd>    Stop the run when the estimated cost exceeds this
                          amount. API billing only (MAX_BUDGET sets a default).
+  --console-log <file>   Append everything this script prints to <file>, colour
+                         codes stripped. The scan's own output is in run.log
+                         either way; this adds the steps around it.
   -y, --yes              Answer every question with the option it defaults to
                          and never wait for input — for CI. Without a terminal
                          on stdin the run does this by itself.
@@ -308,6 +321,8 @@ Plugin and scan:
   OUTPUT_DIR_BASE=<dir>  parent of the report directory when --output-dir is omitted
   OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>  OUTPUT_REPO_PATH=reports/<slug>
   OUTPUT_REPO_PUSH=1|0   OUTPUT_REPO_FILES="threat-model.md threat-model.yaml …"
+      names or globs, matched in the output directory; a --console-log file is
+      published too, wherever it lies
   OUTPUT_GIT_TOKEN=…  OUTPUT_GIT_TOKEN_FILE=<chmod 600>  OUTPUT_GIT_USER=oauth2
   OUTPUT_GIT_NAME=appsec-advisor   OUTPUT_GIT_EMAIL=appsec-advisor@localhost
       write credentials and commit identity for the report repository; kept
@@ -317,7 +332,9 @@ Plugin and scan:
   VERBOSITY=quiet|normal|verbose                   (same as --quiet / --verbose)
   SCAN_MODE=standard|rebuild|rerender             (same as --mode)
   ASSUME_YES=1                                    (same as --yes)
+  CONSOLE_LOG=<file>                              (same as --console-log)
   WITH_SARIF=1  WITH_THREATDRAGON=1  WITH_REQUIREMENTS=1  RUN_QA=0
+  WITH_PDF=1  WITH_HTML=1   (pdf needs pandoc + weasyprint on the machine)
   PENTEST_URL=<http(s) url>         (same as --url) Strix pentest tasks for that URL
   FAIL_ON=critical|high|medium      MAX_DURATION=<seconds>   MAX_BUDGET=<usd>
 
@@ -352,6 +369,7 @@ while [ $# -gt 0 ]; do
         --output-repo) OUTPUT_REPO="${2:?--output-repo needs a git URL}"; shift 2 ;;
         --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; MODE_EXPLICIT=1; shift 2 ;;
         --max-budget)  MAX_BUDGET="${2:?--max-budget needs an amount in USD}"; shift 2 ;;
+        --console-log) CONSOLE_LOG="${2:?--console-log needs a file path}"; shift 2 ;;
         -y|--yes)      ASSUME_YES=1; shift ;;
         --verbose)     VERBOSITY=verbose; shift ;;
         --quiet)       VERBOSITY=quiet;   shift ;;
@@ -364,6 +382,15 @@ while [ $# -gt 0 ]; do
         *)             usage >&2; die "unknown option: $1" ;;
     esac
 done
+
+# From here on, both streams go to the terminal and into the file. The copy is
+# stripped of the colour codes the terminal gets: what reads it is grep and a CI
+# artifact viewer, not a terminal.
+if [ -n "$CONSOLE_LOG" ]; then
+    : >>"$CONSOLE_LOG" || die "cannot write the console log: $CONSOLE_LOG"
+    exec > >(tee >(awk -v e="$(printf '\033')" \
+        '{ gsub(e "\\[[0-9;]*m", ""); print; fflush() }' >>"$CONSOLE_LOG")) 2>&1
+fi
 
 [ -n "$TARGET_DIR" ] || [ -n "$TARGET_REPO" ] || { usage >&2; die "give --target-dir or --target-repo"; }
 [ -n "$TARGET_DIR" ] && [ -n "$TARGET_REPO" ] && die "--target-dir and --target-repo are mutually exclusive"
@@ -1229,6 +1256,8 @@ if [ "$DISCARD_STAGE1" = "1" ]; then ARGS+=(--force); fi
 [ "$WITH_SARIF" = "1" ]         && ARGS+=(--sarif)
 [ "$WITH_THREATDRAGON" = "1" ]  && ARGS+=(--threatdragon)
 [ "$WITH_REQUIREMENTS" = "1" ]  && ARGS+=(--requirements)
+[ "$WITH_PDF" = "1" ]           && ARGS+=(--pdf)
+[ "$WITH_HTML" = "1" ]          && ARGS+=(--html)
 [ -n "$SESSION_MODEL" ]         && ARGS+=(--model "$SESSION_MODEL")
 [ -n "$REASONING_MODEL" ]       && ARGS+=(--reasoning-model "$REASONING_MODEL")
 [ -n "$MAX_DURATION" ]          && ARGS+=(--max-duration "$MAX_DURATION")
@@ -1318,13 +1347,26 @@ if [ -n "$OUTPUT_REPO" ]; then
     PUB_DEST="$PUB_DIR/$OUTPUT_REPO_PATH"
     mkdir -p "$PUB_DEST"
     published=0
-    for name in $OUTPUT_REPO_FILES; do
-        if [ -f "$OUTPUT_DIR/$name" ]; then
-            cp -f "$OUTPUT_DIR/$name" "$PUB_DEST/$name"
+    # Unquoted on purpose: an entry may be a glob (the figures are numbered, and
+    # how many there are is decided by the run). One that matches nothing stays
+    # literal and fails the file test, which is what a missing artifact does too.
+    for pattern in $OUTPUT_REPO_FILES; do
+        for src in "$OUTPUT_DIR"/$pattern; do
+            [ -f "$src" ] || continue
+            name="${src##*/}"
+            cp -f "$src" "$PUB_DEST/$name"
             published=$((published + 1))
             detail "staged $OUTPUT_REPO_PATH/$name"
-        fi
+        done
     done
+    # The console log lives wherever --console-log put it, which is usually not
+    # the output directory. It is still being written while this runs, so what
+    # is published ends at this line — the publish step itself is not in it.
+    if [ -n "$CONSOLE_LOG" ] && [ -f "$CONSOLE_LOG" ]; then
+        cp -f "$CONSOLE_LOG" "$PUB_DEST/${CONSOLE_LOG##*/}"
+        published=$((published + 1))
+        detail "staged $OUTPUT_REPO_PATH/${CONSOLE_LOG##*/}"
+    fi
     if [ "$published" -eq 0 ]; then
         # Say which of the two it is. An empty output repository is fine and
         # says nothing about this; what decides is whether the run produced a
