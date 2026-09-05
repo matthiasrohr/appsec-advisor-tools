@@ -202,6 +202,24 @@ ok()    { printf '      %s✓%s %s\n' "$C_GREEN" "$C_NC" "$*"; }
 warn()  { printf '      %s⚠%s %s\n' "$C_YELLOW" "$C_NC" "$*" >&2; }
 die()   { printf '\n%s✗%s %s\n' "$C_RED" "$C_NC" "$*" >&2; exit 1; }
 
+# One shape for every question this script asks: what it found, then both ways
+# out with what each one costs, so the two are read side by side instead of one
+# after the answer. Returns 0 for the default and 1 for the keyed option.
+#   ask_choice <state> <default option> <[r] option> [<dim note>]
+# Anything but the key takes the default, and the default is always the option
+# that destroys nothing — a typo at this prompt cannot clear an assessment.
+ask_choice() {
+    local reply
+    printf '\n      %s?%s %s\n' "$C_YELLOW" "$C_NC" "$1"
+    [ -n "${4:-}" ] && printf '        %s%s%s\n' "$C_DIM" "$4" "$C_NC"
+    printf '        %s[Enter]%s  %s\n' "$C_GREEN" "$C_NC" "$2"
+    printf '        %s[r]%s      %s\n' "$C_YELLOW" "$C_NC" "$3"
+    printf '        choice: '
+    read -r reply || reply=""
+    printf '\n'
+    case "$reply" in r|R|rebuild) return 1 ;; *) return 0 ;; esac
+}
+
 # Ctrl-C reaches the whole process group, so the scan dies with it — but the
 # runner then exits with SIGPIPE (141), not SIGINT, and bash walks on into the
 # result and publish steps and pushes a report the user just aborted. Stop the
@@ -232,9 +250,11 @@ Options:
   --mode        <mode>   standard (default) = full assessment, history preserved
                          rebuild            = clear model, cache and history first
                          rerender           = re-render from existing Stage-1 data
-                         Without --mode, an output directory that already holds
-                         a run asks which of the first two to use; unattended it
-                         keeps the run and reassesses.
+                         Without --mode, the output directory decides: a
+                         finished report asks whether to keep it, a finished
+                         analysis that was never rendered offers the render,
+                         and what an interrupted analysis left is rebuilt.
+                         Unattended, each of the three takes the first option.
   --max-budget  <usd>    Stop the run when the estimated cost exceeds this
                          amount. API billing only (MAX_BUDGET sets a default).
   --profile-only         Print the target's size, language split and build
@@ -977,43 +997,127 @@ case "$OUTPUT_DIR/" in
         # but docs/security/ during the run invalidate it mid-scan.
         warn "output directory sits inside the scanned repository outside docs/security/ — this can invalidate the run's repository fingerprint" ;;
 esac
+# What a rerender consumes, named the way the runtime's own preflight names it:
+# the merged and triaged analysis, the model, and at least three compose
+# fragments. Asking the same question here means the launcher offers a render
+# exactly where the runtime would perform one, instead of on a proxy of its own
+# that can be true while the render aborts.
+rerender_inputs_missing() {
+    local dir="$1" name count missing=""
+    for name in threat-model.yaml .threats-merged.json .triage-flags.json; do
+        [ -f "$dir/$name" ] || missing="$missing $name"
+    done
+    count="$(find "$dir/.fragments" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${count:-0}" -ge 3 ] || missing="$missing .fragments/(>=3)"
+    printf '%s' "${missing# }"
+}
+
 if [ "$SCAN_MODE" = "rerender" ]; then
-    # A rerender consumes the Stage-1 fragments of an earlier run in this very
-    # directory; without them there is nothing to render.
-    [ -d "$OUTPUT_DIR/.fragments" ] && [ -n "$(ls -A "$OUTPUT_DIR/.fragments" 2>/dev/null)" ] \
-        || die "--mode rerender needs the Stage-1 fragments of an earlier run in $OUTPUT_DIR/.fragments — none there, so run --mode standard first"
+    # A rerender re-renders the assessment of an earlier run in this very
+    # directory; without its artifacts there is nothing to render.
+    rerender_missing="$(rerender_inputs_missing "$OUTPUT_DIR")"
+    [ -z "$rerender_missing" ] \
+        || die "--mode rerender needs the assessment of an earlier run in $OUTPUT_DIR — missing: $rerender_missing; run --mode standard first"
 fi
 
 ok "$OUTPUT_DIR"
 detail "log: $LOG_FILE"
 
-# Only a finished report raises the question. Lock, cache and progress files of a
-# crashed run are not a previous assessment: there is no model and no history to
-# keep, so asking whether to keep them would offer a choice that does not exist.
-PREVIOUS_REPORT=""
-for candidate in threat-model.yaml threat-model.md; do
-    [ -f "$OUTPUT_DIR/$candidate" ] && { PREVIOUS_REPORT="$OUTPUT_DIR/$candidate"; break; }
-done
+# GNU and BSD stat agree on nothing but the file they are asked about.
+file_date() {
+    local d
+    d="$(stat -c '%y' "$1" 2>/dev/null | cut -d' ' -f1)" || d=""
+    [ -n "$d" ] || d="$(stat -f '%Sm' -t '%Y-%m-%d' "$1" 2>/dev/null || true)"
+    printf '%s' "$d"
+}
 
-# Reassessing keeps that report's model, history and cache; a rebuild throws all
-# three away and may change finding IDs. Not a decision to make silently for
-# someone — but only ask where someone can answer, and never where the mode was
-# already chosen.
-if [ -n "$PREVIOUS_REPORT" ] && [ "$PROFILE_ONLY" = "0" ] && [ "$MODE_EXPLICIT" = "0" ]; then
-    prev_when="$(stat -c '%y' "$PREVIOUS_REPORT" 2>/dev/null | cut -d' ' -f1)" || prev_when=""
-    [ -n "$prev_when" ] || prev_when="$(stat -f '%Sm' -t '%Y-%m-%d' "$PREVIOUS_REPORT" 2>/dev/null || true)"
-    if [ -t 0 ]; then
-        printf '\n      a report from %s is already here\n' "${prev_when:-an earlier run}"
-        printf '      [Enter] keep it and reassess · [r] rebuild from scratch\n'
-        printf '      choice: '
-        read -r reply || reply=""
-        case "$reply" in
-            r|R|rebuild) SCAN_MODE="rebuild";  ok "rebuilding — the previous model, cache and history are cleared" ;;
-            *)           SCAN_MODE="standard"; ok "reassessing — the previous report is kept" ;;
-        esac
-    else
-        info "a report from ${prev_when:-an earlier run} is already here — reassessing and keeping it; --mode rebuild starts from scratch"
+# What is in here, and whether it is a finished assessment at all. threat-model.md
+# is the plugin's own completion marker — its runtime_cleanup.py refuses to clean
+# a directory without one — and the orchestrator deletes .appsec-checkpoint when
+# a run completes, so a checkpoint still lying here is a run that stopped.
+# threat-model.yaml settles nothing: it grows while the analysis is still
+# running, and a run killed halfway leaves a large one behind that no report was
+# ever composed from. Asking "keep it?" about that offered to keep a torso.
+CHECKPOINT_FILE="$OUTPUT_DIR/.appsec-checkpoint"
+PREVIOUS_REPORT=""
+[ -f "$OUTPUT_DIR/threat-model.md" ] && PREVIOUS_REPORT="$OUTPUT_DIR/threat-model.md"
+DISCARD_STAGE1=0
+
+# The one interruption this runtime can continue: Stage 1 finished and was
+# validated, only the report was never rendered. Everything else it refuses —
+# --resume and --incremental are gone, and a fresh run restarts Stage 1 whatever
+# a stopped one left behind. The three tokens are the ones the plugin's own guard
+# reads, each matched on its own so their order in the line stays irrelevant.
+CHECKPOINT_NEEDS_RENDER=0
+if [ -f "$CHECKPOINT_FILE" ] \
+        && grep -q 'phase=10b'        "$CHECKPOINT_FILE" \
+        && grep -q 'status=completed' "$CHECKPOINT_FILE" \
+        && grep -q 'need_render=true' "$CHECKPOINT_FILE"; then
+    CHECKPOINT_NEEDS_RENDER=1
+fi
+# That checkpoint says Stage 1 reached the boundary, not that what it left can
+# still be rendered — a run killed during the compose leaves the marker and a
+# fragment set the renderer rejects. Only offer the render when the runtime's own
+# preflight would accept the inputs.
+STAGE1_RENDERABLE=0
+if [ "$CHECKPOINT_NEEDS_RENDER" = "1" ] && [ -z "$(rerender_inputs_missing "$OUTPUT_DIR")" ]; then
+    STAGE1_RENDERABLE=1
+fi
+
+# Reassessing keeps the previous report's model, history and cache; a rebuild
+# throws all three away and may change finding IDs. Not a decision to make
+# silently for someone — but only ask where someone can answer, never where the
+# mode was already chosen, and never where the leftovers leave nothing to choose.
+if [ "$PROFILE_ONLY" = "0" ] && [ "$MODE_EXPLICIT" = "0" ]; then
+    if [ "$STAGE1_RENDERABLE" = "1" ]; then
+        prev_when="$(file_date "$CHECKPOINT_FILE")"
+        SCAN_MODE="rerender"
+        if [ -t 0 ]; then
+            if ask_choice \
+                "a run from ${prev_when:-an earlier day} finished its analysis but never rendered a report" \
+                "render that analysis, nothing is analyzed again" \
+                "rebuild from scratch; that finished analysis is discarded"; then
+                ok "rendering the finished analysis — nothing is analyzed again"
+            else
+                SCAN_MODE="rebuild"
+                ok "rebuilding — that finished analysis is discarded"
+            fi
+        else
+            info "a run from ${prev_when:-an earlier day} finished its analysis but never rendered a report — rendering it; --mode rebuild starts from scratch"
+        fi
+    elif [ -n "$PREVIOUS_REPORT" ]; then
+        prev_when="$(file_date "$PREVIOUS_REPORT")"
+        residue_note=""
+        [ -f "$CHECKPOINT_FILE" ] && residue_note="a later run stopped before finishing; either choice clears what it left"
+        if [ -t 0 ]; then
+            if ask_choice \
+                "a report from ${prev_when:-an earlier run} is already here" \
+                "reassess and keep that report, its history and finding ids" \
+                "rebuild from scratch; history and finding ids are not kept" \
+                "$residue_note"; then
+                SCAN_MODE="standard"; ok "reassessing — the previous report is kept"
+            else
+                SCAN_MODE="rebuild";  ok "rebuilding — the previous model, cache and history are cleared"
+            fi
+        else
+            [ -n "$residue_note" ] && detail "$residue_note"
+            info "a report from ${prev_when:-an earlier run} is already here — reassessing and keeping it; --mode rebuild starts from scratch"
+        fi
+    elif [ -f "$CHECKPOINT_FILE" ] || [ -f "$OUTPUT_DIR/threat-model.yaml" ]; then
+        # Analysis broken off, no report, and a model file that stopped growing
+        # wherever the run died. Reassessing would keep that torso as the run's
+        # own prior model — the next model carries its components, boundaries and
+        # meta-findings forward, none of which was ever validated or rendered.
+        # There is nothing here to keep, so the one question this could ask has
+        # one answer: take it, and say so.
+        SCAN_MODE="rebuild"
+        info "an earlier run stopped in here before it had a report — starting from scratch"
     fi
+    # Any run but a render is refused over that Stage-1 boundary unless the
+    # discard is stated. Every path that arrives here with another mode has
+    # stated it: someone chose it over the offered render, or the boundary points
+    # at artifacts that can no longer be rendered at all.
+    if [ "$CHECKPOINT_NEEDS_RENDER" = "1" ] && [ "$SCAN_MODE" != "rerender" ]; then DISCARD_STAGE1=1; fi
 fi
 
 if [ -n "$OUTPUT_REPO" ]; then
@@ -1079,6 +1183,9 @@ case "$SCAN_MODE" in
     rebuild)  ARGS+=(--rebuild) ;;
     rerender) ARGS+=(--rerender) ;;
 esac
+# Step 4 settles this: the runtime refuses to analyze over an unrendered Stage-1
+# boundary, and only a run that knowingly leaves that boundary behind says so.
+if [ "$DISCARD_STAGE1" = "1" ]; then ARGS+=(--force); fi
 [ "$RUN_QA" = "0" ]             && ARGS+=(--no-qa)
 [ "$WITH_SARIF" = "1" ]         && ARGS+=(--sarif)
 [ "$WITH_THREATDRAGON" = "1" ]  && ARGS+=(--threatdragon)
