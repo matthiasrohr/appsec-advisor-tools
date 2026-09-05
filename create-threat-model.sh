@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# appsec-scan.sh — Launcher for the AppSec Advisor threat-model plugin.
+# create-threat-model.sh — headless launcher for the AppSec Advisor skill of
+# the same name. It runs that one skill; the plugin's other skills are not
+# reachable from here.
 #
-#   appsec-scan.sh --target-dir  <path> [--output-dir <dir>]
-#   appsec-scan.sh --target-repo <url>  [--output-dir <dir>] [--target-ref <ref>]
+#   create-threat-model.sh --target-dir  <path> [--output-dir <dir>]
+#   create-threat-model.sh --target-repo <url>  [--output-dir <dir>] [--target-ref <ref>]
 #
 # What it does: provision the plugin (official GitHub repo at a configurable
 # ref, or a local checkout / self-packaged build), provision the target (local
@@ -11,7 +13,7 @@
 # headless runner (scripts/run-headless.sh → claude -p).
 #
 # Every value in the CONFIGURATION block can be overridden from the
-# environment:  ADVISOR_REF=dev ASSESSMENT_DEPTH=quick appsec-scan.sh …
+# environment:  ADVISOR_REF=dev ASSESSMENT_DEPTH=quick create-threat-model.sh …
 # ─────────────────────────────────────────────────────────────────────────────
 
 # This script uses bash features (arrays, pipefail). Started as `sh script.sh`
@@ -20,7 +22,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         exec bash "$0" "$@"
     fi
-    echo "appsec-scan.sh needs bash — install it, or run: bash $0" >&2
+    echo "create-threat-model.sh needs bash — install it, or run: bash $0" >&2
     exit 1
 fi
 
@@ -29,6 +31,15 @@ set -Eeuo pipefail
 # Where this script lives, so an optional companion next to it is found without
 # configuration, wherever the pair was copied to.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# This launcher was called appsec-scan.sh until it was renamed after the skill
+# it runs, and machines that ran it still hold its cache and key files under
+# that name. A default path therefore points at the new location but keeps the
+# old one while that is the one that exists — a rename must not send the next
+# run looking for the API key where it is not.
+path_or_legacy() {
+    if [ -e "$1" ] || [ ! -e "$2" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
 
 # ══════════════════════════ CONFIGURATION ═══════════════════════════════════
 
@@ -50,8 +61,10 @@ ADVISOR_REF="${ADVISOR_REF:-latest}"
 #   • a package tarball           (~/appsec-advisor/dist/<internal-name>-x.y.z.tgz)
 ADVISOR_LOCAL_PATH="${ADVISOR_LOCAL_PATH:-$HOME/appsec-advisor}"
 
-# Clones, unpacked packages and sanitized target copies live here.
-CACHE_DIR="${APPSEC_SCAN_CACHE:-$HOME/.cache/appsec-scan}"
+# Clones, unpacked packages and sanitized target copies live here. The cache
+# belongs to the tool family, not to this one script, so it is not named after
+# it. APPSEC_SCAN_CACHE is the earlier name of the variable and still works.
+CACHE_DIR="${APPSEC_ADVISOR_CACHE:-${APPSEC_SCAN_CACHE:-$(path_or_legacy "$HOME/.cache/appsec-advisor" "$HOME/.cache/appsec-scan")}}"
 
 # ── Scan options (forwarded to run-headless.sh) ──────────────────────────────
 ASSESSMENT_DEPTH="${ASSESSMENT_DEPTH:-standard}"  # quick | standard | thorough
@@ -89,11 +102,10 @@ AUTH_MODE="${AUTH_MODE:-auto}"
 # settings only name a source.
 #
 #   aws    — AWS Secrets Manager through the AWS CLI (AWS_SECRET_ID below)
-#   gitlab — GitLab Secrets Manager through appsec-key-from-gitlab.sh
 #   cmd    — any command that prints the key on stdout (ANTHROPIC_API_KEY_CMD)
 #   file   — a file holding the key (ANTHROPIC_API_KEY_FILE), chmod 600
 #   env    — ANTHROPIC_API_KEY already exported, e.g. a masked GitLab CI variable
-#   auto   — first configured source wins, in the order: cmd, aws, gitlab, file, env
+#   auto   — first configured source wins, in the order: cmd, aws, file, env
 KEY_SOURCE="${KEY_SOURCE:-auto}"
 
 # KEY_SOURCE=aws. Region and credentials come from the AWS CLI's own settings
@@ -101,15 +113,9 @@ KEY_SOURCE="${KEY_SOURCE:-auto}"
 AWS_SECRET_ID="${AWS_SECRET_ID:-}"          # name or ARN of the secret
 AWS_SECRET_FIELD="${AWS_SECRET_FIELD:-}"    # JSON field; empty = secret holds the bare key
 
-# KEY_SOURCE=gitlab. Needs the companion script appsec-key-from-gitlab.sh, which
-# is OPTIONAL: without it every other key source and the whole scan still work.
-# It reads GITLAB_URL, GITLAB_PROJECT, GITLAB_SECRET_NAME and the GitLab token
-# itself — see its --help. Looked for next to this script by default.
-GITLAB_KEY_HELPER="${GITLAB_KEY_HELPER:-$SCRIPT_DIR/appsec-key-from-gitlab.sh}"
-
 # KEY_SOURCE=cmd / file
 ANTHROPIC_API_KEY_CMD="${ANTHROPIC_API_KEY_CMD:-}"
-ANTHROPIC_API_KEY_FILE="${ANTHROPIC_API_KEY_FILE:-$HOME/.config/appsec-scan/api-key}"
+ANTHROPIC_API_KEY_FILE="${ANTHROPIC_API_KEY_FILE:-$(path_or_legacy "$HOME/.config/appsec-advisor/api-key" "$HOME/.config/appsec-scan/api-key")}"
 
 KEY_FETCH_TIMEOUT="${KEY_FETCH_TIMEOUT:-60}"  # seconds allowed for fetching the key
 
@@ -132,8 +138,7 @@ CLONE_DEPTH="${CLONE_DEPTH:-1}"                   # 0 → full history (needed f
 # whatever it already has: a credential helper, or a key for an ssh URL. The
 # token reaches git through a credential helper, so it appears neither in the
 # process list nor in the clone's .git/config. It is NOT the same token as
-# GITLAB_TOKEN, which only talks to the Secrets Manager; set them to the same
-# value deliberately if one token should do both.
+# OUTPUT_GIT_TOKEN below, which writes the report repository.
 TARGET_GIT_TOKEN="${TARGET_GIT_TOKEN:-}"
 TARGET_GIT_TOKEN_FILE="${TARGET_GIT_TOKEN_FILE:-}"   # file holding it, chmod 600
 TARGET_GIT_USER="${TARGET_GIT_USER:-oauth2}"         # GitLab: oauth2, GitHub: x-access-token
@@ -153,8 +158,8 @@ OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat
 OUTPUT_GIT_TOKEN="${OUTPUT_GIT_TOKEN:-}"
 OUTPUT_GIT_TOKEN_FILE="${OUTPUT_GIT_TOKEN_FILE:-}"   # file holding it, chmod 600
 OUTPUT_GIT_USER="${OUTPUT_GIT_USER:-oauth2}"
-OUTPUT_GIT_NAME="${OUTPUT_GIT_NAME:-appsec-scan}"
-OUTPUT_GIT_EMAIL="${OUTPUT_GIT_EMAIL:-appsec-scan@localhost}"
+OUTPUT_GIT_NAME="${OUTPUT_GIT_NAME:-appsec-advisor}"
+OUTPUT_GIT_EMAIL="${OUTPUT_GIT_EMAIL:-appsec-advisor@localhost}"
 # Parent directory for the report when --output-dir is omitted. OUTPUT_BASE is
 # the earlier name for this and still works.
 OUTPUT_DIR_BASE="${OUTPUT_DIR_BASE:-${OUTPUT_BASE:-$PWD/appsec-reports}}"
@@ -197,14 +202,25 @@ ok()    { printf '      %s✓%s %s\n' "$C_GREEN" "$C_NC" "$*"; }
 warn()  { printf '      %s⚠%s %s\n' "$C_YELLOW" "$C_NC" "$*" >&2; }
 die()   { printf '\n%s✗%s %s\n' "$C_RED" "$C_NC" "$*" >&2; exit 1; }
 
+# Ctrl-C reaches the whole process group, so the scan dies with it — but the
+# runner then exits with SIGPIPE (141), not SIGINT, and bash walks on into the
+# result and publish steps and pushes a report the user just aborted. Stop the
+# launcher with the run instead.
+on_interrupt() {
+    trap - INT TERM
+    printf '\n%s✗%s interrupted at step %d/%d\n' "$C_RED" "$C_NC" "$STEP" "$TOTAL_STEPS" >&2
+    exit 130
+}
+trap on_interrupt INT TERM
+
 usage() {
     cat <<'HELP'
-appsec-scan.sh — run the AppSec Advisor threat model headlessly against a
-repository, and optionally publish the report.
+create-threat-model.sh — run the AppSec Advisor skill create-threat-model
+headlessly against a repository, and optionally publish the report.
 
 Usage:
-  appsec-scan.sh --target-dir  <path> [options]
-  appsec-scan.sh --target-repo <url>  [options]
+  create-threat-model.sh --target-dir  <path> [options]
+  create-threat-model.sh --target-repo <url>  [options]
 
 Options:
   --target-dir  <path>   Local directory to scan
@@ -227,9 +243,9 @@ Options:
   --help config          Every configuration variable and its values
 
 Examples:
-  appsec-scan.sh --target-dir ~/myapp
-  KEY_SOURCE=aws AWS_SECRET_ID=appsec-scan/anthropic-api-key \
-      appsec-scan.sh --target-repo https://gitlab.example.com/team/app.git
+  create-threat-model.sh --target-dir ~/myapp
+  KEY_SOURCE=aws AWS_SECRET_ID=appsec-advisor/anthropic-api-key \
+      create-threat-model.sh --target-repo https://gitlab.example.com/team/app.git
 
 Configuration comes from the CONFIGURATION block at the top of this file; every
 value there can be overridden from the environment.
@@ -251,7 +267,7 @@ Plugin and scan:
   OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>  OUTPUT_REPO_PATH=reports/<slug>
   OUTPUT_REPO_PUSH=1|0   OUTPUT_REPO_FILES="threat-model.md threat-model.yaml …"
   OUTPUT_GIT_TOKEN=…  OUTPUT_GIT_TOKEN_FILE=<chmod 600>  OUTPUT_GIT_USER=oauth2
-  OUTPUT_GIT_NAME=appsec-scan   OUTPUT_GIT_EMAIL=appsec-scan@localhost
+  OUTPUT_GIT_NAME=appsec-advisor   OUTPUT_GIT_EMAIL=appsec-advisor@localhost
       write credentials and commit identity for the report repository; kept
       separate from the target ones because writing is a different privilege
   ASSESSMENT_DEPTH=quick|standard|thorough        TRUST_MODE=untrusted|trusted
@@ -262,20 +278,16 @@ Plugin and scan:
 
 Service key (the key value never belongs in this file, only its source):
   AUTH_MODE=auto|api-key|subscription
-  KEY_SOURCE=auto|aws|gitlab|cmd|file|env       KEY_FETCH_TIMEOUT=<seconds>
+  KEY_SOURCE=auto|aws|cmd|file|env              KEY_FETCH_TIMEOUT=<seconds>
           auto takes the first configured source, in this order:
-          cmd, aws, gitlab, file, env — name a source explicitly to override it
+          cmd, aws, file, env — name a source explicitly to override it
   VERIFY_AUTH=auto|1|0     one tiny request that proves the credential is accepted
 
   aws     AWS_SECRET_ID=<name|arn>  AWS_SECRET_FIELD=<json field, optional>
           region and credentials come from the AWS CLI (AWS_REGION, AWS_PROFILE, SSO,
           instance role)
-  gitlab  GITLAB_URL=… GITLAB_PROJECT=… GITLAB_SECRET_NAME=…
-          needs the optional companion appsec-key-from-gitlab.sh next to this
-          script (GITLAB_KEY_HELPER overrides the path); every other source and
-          the scan itself work without that file. Check it with --check.
   cmd     ANTHROPIC_API_KEY_CMD="…"              any command printing the key
-  file    ANTHROPIC_API_KEY_FILE=~/.config/appsec-scan/api-key   (chmod 600)
+  file    ANTHROPIC_API_KEY_FILE=~/.config/appsec-advisor/api-key   (chmod 600)
   env     ANTHROPIC_API_KEY=…                    e.g. a masked GitLab CI variable
 HELP
 }
@@ -319,7 +331,7 @@ case "$SCAN_MODE" in
     *) die "--mode must be standard, rebuild or rerender (got: $SCAN_MODE)" ;;
 esac
 case "$AUTH_MODE"        in auto|api-key|subscription) ;; *) die "AUTH_MODE must be auto, api-key or subscription (got: $AUTH_MODE)" ;; esac
-case "$KEY_SOURCE"       in auto|aws|gitlab|cmd|file|env) ;; *) die "KEY_SOURCE must be auto, aws, gitlab, cmd, file or env (got: $KEY_SOURCE)" ;; esac
+case "$KEY_SOURCE"       in auto|aws|cmd|file|env) ;; *) die "KEY_SOURCE must be auto, aws, cmd, file or env (got: $KEY_SOURCE)" ;; esac
 case "$KEY_FETCH_TIMEOUT" in ''|*[!0-9]*) die "KEY_FETCH_TIMEOUT must be a whole number of seconds (got: $KEY_FETCH_TIMEOUT)" ;; esac
 [ -z "$MAX_BUDGET" ] || case "$MAX_BUDGET" in
     *[!0-9.]*|.*|*.*.*|0|0.0|0.00) die "--max-budget must be a positive amount in USD (got: $MAX_BUDGET)" ;;
@@ -416,7 +428,6 @@ select_key_source() {
     if [ "$s" = "auto" ]; then
         if   [ -n "$ANTHROPIC_API_KEY_CMD" ]; then s="cmd"
         elif [ -n "$AWS_SECRET_ID" ];         then s="aws"
-        elif [ -n "${GITLAB_URL:-}" ] && [ -n "${GITLAB_PROJECT:-}" ]; then s="gitlab"
         elif [ -n "$ANTHROPIC_API_KEY_FILE" ] && [ -f "$ANTHROPIC_API_KEY_FILE" ]; then s="file"
         elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then s="env"
         else s="none"
@@ -439,12 +450,6 @@ check_key_source() {
                     *) die "no AWS region configured — set AWS_REGION, run 'aws configure', or give AWS_SECRET_ID as a full ARN" ;;
                 esac
             fi ;;
-        gitlab)
-            [ -e "$GITLAB_KEY_HELPER" ] \
-                || die "KEY_SOURCE=gitlab needs the companion script appsec-key-from-gitlab.sh, which was not found at $GITLAB_KEY_HELPER. It is optional and used for this key source only — put it next to this script, point GITLAB_KEY_HELPER at it, or use another KEY_SOURCE (aws, cmd, file, env)"
-            [ -x "$GITLAB_KEY_HELPER" ] || die "the GitLab key helper is not executable — run: chmod +x $GITLAB_KEY_HELPER"
-            [ -n "${GITLAB_URL:-}" ]     || die "KEY_SOURCE=gitlab, but GITLAB_URL is not set (see $GITLAB_KEY_HELPER --help)"
-            [ -n "${GITLAB_PROJECT:-}" ] || die "KEY_SOURCE=gitlab, but GITLAB_PROJECT is not set (see $GITLAB_KEY_HELPER --help)" ;;
         cmd)
             [ -n "$ANTHROPIC_API_KEY_CMD" ] || die "KEY_SOURCE=cmd, but ANTHROPIC_API_KEY_CMD is empty" ;;
         file)
@@ -475,7 +480,6 @@ fetch_key() {  # prints the raw secret on stdout; the caller captures stderr
     case "$KEY_SOURCE_EFFECTIVE" in
         aws)    run_bounded aws secretsmanager get-secret-value \
                     --secret-id "$AWS_SECRET_ID" --query SecretString --output text ;;
-        gitlab) run_bounded "$GITLAB_KEY_HELPER" ;;
         # The command comes from this launcher's own configuration, never from
         # scanned repository content, so a shell is the right thing to run it in.
         cmd)    run_bounded sh -c "$ANTHROPIC_API_KEY_CMD" ;;
@@ -505,8 +509,6 @@ explain_key_failure() {  # explain_key_failure <exit-code> <backend-stderr>
                     die "AWS refused the request for '$AWS_SECRET_ID' — the secret may be scheduled for deletion" ;;
                 *)  die "reading '$AWS_SECRET_ID' from AWS Secrets Manager failed (aws exit $rc)" ;;
             esac ;;
-        gitlab)
-            die "the GitLab key helper failed (exit $rc) — its message is above; '$GITLAB_KEY_HELPER --check' verifies the setup end to end" ;;
         cmd)
             die "ANTHROPIC_API_KEY_CMD failed (exit $rc)" ;;
         *)
@@ -617,7 +619,7 @@ resolve_auth() {
     select_key_source
     if [ "$KEY_SOURCE_EFFECTIVE" = "none" ]; then
         if [ "$AUTH_MODE" = "api-key" ]; then
-            die "AUTH_MODE=api-key, but no key source is configured — set KEY_SOURCE and its settings (AWS_SECRET_ID, GITLAB_URL/GITLAB_PROJECT, ANTHROPIC_API_KEY_CMD, ANTHROPIC_API_KEY_FILE or ANTHROPIC_API_KEY)"
+            die "AUTH_MODE=api-key, but no key source is configured — set KEY_SOURCE and its settings (AWS_SECRET_ID, ANTHROPIC_API_KEY_CMD, ANTHROPIC_API_KEY_FILE or ANTHROPIC_API_KEY)"
         fi
         unset ANTHROPIC_API_KEY
         AUTH_DESC="subscription (no service key configured)"
@@ -629,7 +631,6 @@ resolve_auth() {
     local key="" origin="" err_file="" err_text="" rc=0
     case "$KEY_SOURCE_EFFECTIVE" in
         aws)    origin="AWS Secrets Manager ($AWS_SECRET_ID)" ;;
-        gitlab) origin="GitLab Secrets Manager (${GITLAB_SECRET_NAME:-anthropic-api-key} in ${GITLAB_PROJECT:-?})" ;;
         cmd)    origin="ANTHROPIC_API_KEY_CMD" ;;
         file)   origin="$ANTHROPIC_API_KEY_FILE" ;;
         env)    origin="the environment" ;;
@@ -1039,10 +1040,10 @@ step "Profile target"
 # costs a directory walk. Two invocations because the script renders either text
 # or JSON, never both — the same walk twice.
 #
-# The copy next to this launcher wins, the way appsec-key-from-gitlab.sh does:
-# it makes the profile work with any pinned ADVISOR_REF. It is a copy of the
-# plugin's scripts/repo_profile.py, which is where the file is maintained and
-# tested; the provisioned plugin is the fallback when the companion is absent.
+# The copy next to this launcher wins: it makes the profile work with any pinned
+# ADVISOR_REF. It is a copy of the plugin's scripts/repo_profile.py, which is
+# where the file is maintained and tested; the provisioned plugin is the
+# fallback when the companion is absent.
 PROFILE_SCRIPT="$SCRIPT_DIR/repo_profile.py"
 [ -f "$PROFILE_SCRIPT" ] || PROFILE_SCRIPT="$PLUGIN_DIR/scripts/repo_profile.py"
 PROFILE_JSON="$OUTPUT_DIR/.target-profile.json"
@@ -1097,7 +1098,7 @@ detail "run-headless.sh ${ARGS[*]}"
 printf '\n'
 
 {
-    printf '=== appsec-scan %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '=== create-threat-model %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'plugin : %s (%s)\n' "$PLUGIN_DIR" "$ADVISOR_VERSION"
     printf 'target : %s\n' "$TARGET"
     printf 'auth   : %s\n' "$AUTH_DESC"
