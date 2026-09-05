@@ -68,6 +68,10 @@ RUN_QA="${RUN_QA:-1}"                             # 0 → --no-qa (faster, less 
 #   standard = full assessment, report history preserved
 #   rebuild  = clear the prior model, cache and history first; finding IDs may change
 #   rerender = rebuild the report from the existing Stage-1 fragments, no analysis
+# Whether the mode was chosen deliberately. Evaluated before the default lands,
+# because an output directory holding a previous run asks for the mode — and it
+# must not ask someone who has already answered.
+[ -n "${SCAN_MODE:-}" ] && MODE_EXPLICIT=1 || MODE_EXPLICIT=0
 SCAN_MODE="${SCAN_MODE:-standard}"
 FAIL_ON="${FAIL_ON:-}"                            # critical | high | medium → non-zero exit
 MAX_DURATION="${MAX_DURATION:-}"                  # seconds; empty = no wall-clock limit
@@ -185,7 +189,7 @@ else
 fi
 
 STEP=0
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 step()  { STEP=$((STEP + 1)); printf '\n%s▶ [%d/%d] %s%s\n' "$C_CYAN" "$STEP" "$TOTAL_STEPS" "$*" "$C_NC"; }
 info()  { printf '      %s\n' "$*"; }
 detail(){ printf '      %s%s%s\n' "$C_DIM" "$*" "$C_NC"; }
@@ -212,8 +216,13 @@ Options:
   --mode        <mode>   standard (default) = full assessment, history preserved
                          rebuild            = clear model, cache and history first
                          rerender           = re-render from existing Stage-1 data
+                         Without --mode, an output directory that already holds
+                         a run asks which of the first two to use; unattended it
+                         keeps the run and reassesses.
   --max-budget  <usd>    Stop the run when the estimated cost exceeds this
                          amount. API billing only (MAX_BUDGET sets a default).
+  --profile-only         Print the target's size, language split and build
+                         manifests, then stop. No model, no credential, no cost.
   -h, --help             This help
   --help config          Every configuration variable and its values
 
@@ -272,9 +281,10 @@ HELP
 }
 
 # ── Arguments ────────────────────────────────────────────────────────────────
-TARGET_DIR=""; TARGET_REPO=""; TARGET_REF=""; OUTPUT_DIR=""
+TARGET_DIR=""; TARGET_REPO=""; TARGET_REF=""; OUTPUT_DIR=""; PROFILE_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
+        --profile-only) PROFILE_ONLY=1; shift ;;
         --target-dir)  TARGET_DIR="${2:?--target-dir needs a path}";  shift 2 ;;
         --target-repo) TARGET_REPO="${2:?--target-repo needs a URL}"; shift 2 ;;
         --target-ref)  TARGET_REF="${2:?--target-ref needs a ref}";   shift 2 ;;
@@ -282,7 +292,7 @@ while [ $# -gt 0 ]; do
                        OUTPUT_DIR="${2:?--output-dir needs a path}";  shift 2 ;;
         --context)     CONTEXT_SRC="${2:?--context needs a URL or a file path}"; shift 2 ;;
         --output-repo) OUTPUT_REPO="${2:?--output-repo needs a git URL}"; shift 2 ;;
-        --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; shift 2 ;;
+        --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; MODE_EXPLICIT=1; shift 2 ;;
         --max-budget)  MAX_BUDGET="${2:?--max-budget needs an amount in USD}"; shift 2 ;;
         -h|--help)
             case "${2:-}" in
@@ -297,6 +307,7 @@ done
 [ -n "$TARGET_DIR" ] || [ -n "$TARGET_REPO" ] || { usage >&2; die "give --target-dir or --target-repo"; }
 [ -n "$TARGET_DIR" ] && [ -n "$TARGET_REPO" ] && die "--target-dir and --target-repo are mutually exclusive"
 [ -z "$TARGET_REF" ] || [ -n "$TARGET_REPO" ] || die "--target-ref applies to --target-repo only"
+[ "$PROFILE_ONLY" = "0" ] || [ -z "$OUTPUT_REPO" ] || die "--profile-only produces no report, so there is nothing to publish to --output-repo"
 
 case "$ADVISOR_SOURCE"   in official|local) ;; *) die "ADVISOR_SOURCE must be 'official' or 'local' (got: $ADVISOR_SOURCE)" ;; esac
 case "$TRUST_MODE"       in untrusted|trusted) ;; *) die "TRUST_MODE must be 'untrusted' or 'trusted' (got: $TRUST_MODE)" ;; esac
@@ -379,7 +390,9 @@ raw_name="${raw_name%/}"; raw_name="${raw_name##*/}"; raw_name="${raw_name%.git}
 SLUG="$(printf '%s' "$raw_name" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
 [ -n "$SLUG" ] || SLUG="target"
 [ -n "$OUTPUT_REPO_PATH" ] || OUTPUT_REPO_PATH="reports/$SLUG"
-[ -n "$OUTPUT_REPO" ] && TOTAL_STEPS=7
+[ -n "$OUTPUT_REPO" ] && TOTAL_STEPS=8
+# Preflight, plugin, target, output directory, profile — and then nothing.
+[ "$PROFILE_ONLY" = "1" ] && TOTAL_STEPS=5
 
 # A git URL is handed to `git clone`; a leading dash would become an option and
 # ext:: would make git execute a command from the URL.
@@ -546,6 +559,9 @@ git_output() { git_auth "$OUTPUT_GIT_USER" "$OUTPUT_GIT_TOKEN" "$@"; }
 # Is the remote there, and may we read it? Answered before a clone starts.
 check_remote_repo() {  # check_remote_repo <url> <description> [none|target|output] [allow-empty]
     local url="$1" what="$2" creds="${3:-none}" allow_empty="${4:-0}" err rc=0 text
+    # Reset per call: the caller reads it to say so in its own words instead of
+    # letting git's "cloned an empty repository" warning speak for the launcher.
+    REMOTE_EMPTY=0
     err="$(mktemp)"
     case "$creds" in
         target) GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_target ls-remote --quiet --exit-code -- "$url" HEAD >/dev/null 2>"$err" || rc=$? ;;
@@ -558,7 +574,10 @@ check_remote_repo() {  # check_remote_repo <url> <description> [none|target|outp
     case "$rc" in
         2)   # An empty repository has nothing to scan, but it is a perfectly
              # good place to publish the first report into.
-             [ "$allow_empty" = "1" ] && return 0
+             if [ "$allow_empty" = "1" ]; then
+                 REMOTE_EMPTY=1
+                 return 0
+             fi
              die "$what is an empty repository: $url" ;;
         124) die "$url did not answer within ${KEY_FETCH_TIMEOUT}s — check the network or the VPN" ;;
     esac
@@ -687,22 +706,30 @@ step "Preflight"
 CLAUDE_EXECUTABLE="${APPSEC_CLAUDE_EXECUTABLE:-claude}"
 command -v git >/dev/null 2>&1 || die "git not found"
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
-command -v "$CLAUDE_EXECUTABLE" >/dev/null 2>&1 \
-    || die "Claude Code CLI not found ($CLAUDE_EXECUTABLE). Install it: https://claude.ai/download"
-python3 -c 'import yaml, jsonschema' >/dev/null 2>&1 \
-    || die "python3 is missing pyyaml/jsonschema — the pipeline needs both: python3 -m pip install pyyaml jsonschema"
-
 ok "git $(git --version | awk '{print $3}'), python3 $(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')"
-ok "claude $("$CLAUDE_EXECUTABLE" --version 2>/dev/null | head -1)"
 
-resolve_auth
-if [ -n "$MAX_BUDGET" ] && [ "${KEY_SOURCE_EFFECTIVE:-none}" = "none" ]; then
-    warn "a spend cap only limits API-billed runs; this one bills against the subscription, so \$$MAX_BUDGET is ignored"
+# The profile is a directory walk. It needs neither the CLI, nor the pipeline's
+# python packages, nor a credential — requiring them would keep the one mode
+# that costs nothing out of the places that have no key.
+if [ "$PROFILE_ONLY" = "1" ]; then
+    AUTH_DESC="not used (--profile-only)"
+    ok "profile only — no credential needed, no model will be called"
+else
+    command -v "$CLAUDE_EXECUTABLE" >/dev/null 2>&1 \
+        || die "Claude Code CLI not found ($CLAUDE_EXECUTABLE). Install it: https://claude.ai/download"
+    python3 -c 'import yaml, jsonschema' >/dev/null 2>&1 \
+        || die "python3 is missing pyyaml/jsonschema — the pipeline needs both: python3 -m pip install pyyaml jsonschema"
+    ok "claude $("$CLAUDE_EXECUTABLE" --version 2>/dev/null | head -1)"
+
+    resolve_auth
+    if [ -n "$MAX_BUDGET" ] && [ "${KEY_SOURCE_EFFECTIVE:-none}" = "none" ]; then
+        warn "a spend cap only limits API-billed runs; this one bills against the subscription, so \$$MAX_BUDGET is ignored"
+    fi
+    case "$VERIFY_AUTH" in
+        1)    verify_auth "${KEY_ORIGIN:-the configured credential}" ;;
+        auto) [ "${KEY_SOURCE_EFFECTIVE:-none}" != "none" ] && verify_auth "${KEY_ORIGIN:-the configured credential}" ;;
+    esac
 fi
-case "$VERIFY_AUTH" in
-    1)    verify_auth "${KEY_ORIGIN:-the configured credential}" ;;
-    auto) [ "${KEY_SOURCE_EFFECTIVE:-none}" != "none" ] && verify_auth "${KEY_ORIGIN:-the configured credential}" ;;
-esac
 
 # The plugin fetches a context URL through its own URL policy, which rejects
 # hosts resolving to private, loopback or reserved addresses. Say so now rather
@@ -837,7 +864,9 @@ if [ "$ADVISOR_SOURCE" = "official" ]; then provision_official; else provision_l
 
 [ -f "$PLUGIN_DIR/.claude-plugin/plugin.json" ] || die "not a plugin directory: $PLUGIN_DIR"
 RUNNER="$PLUGIN_DIR/scripts/run-headless.sh"
-[ -x "$RUNNER" ] || [ -f "$RUNNER" ] || die "headless runner missing: $RUNNER"
+# --profile-only never reaches the runner, so a plugin that cannot scan is no
+# reason to refuse a directory walk.
+[ "$PROFILE_ONLY" = "1" ] || [ -x "$RUNNER" ] || [ -f "$RUNNER" ] || die "headless runner missing: $RUNNER"
 PLUGIN_NAME="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("name","?"))' "$PLUGIN_DIR/.claude-plugin/plugin.json" 2>/dev/null || echo '?')"
 ok "plugin '$PLUGIN_NAME' — $ADVISOR_VERSION"
 detail "$PLUGIN_DIR"
@@ -957,6 +986,35 @@ fi
 ok "$OUTPUT_DIR"
 detail "log: $LOG_FILE"
 
+# Only a finished report raises the question. Lock, cache and progress files of a
+# crashed run are not a previous assessment: there is no model and no history to
+# keep, so asking whether to keep them would offer a choice that does not exist.
+PREVIOUS_REPORT=""
+for candidate in threat-model.yaml threat-model.md; do
+    [ -f "$OUTPUT_DIR/$candidate" ] && { PREVIOUS_REPORT="$OUTPUT_DIR/$candidate"; break; }
+done
+
+# Reassessing keeps that report's model, history and cache; a rebuild throws all
+# three away and may change finding IDs. Not a decision to make silently for
+# someone — but only ask where someone can answer, and never where the mode was
+# already chosen.
+if [ -n "$PREVIOUS_REPORT" ] && [ "$PROFILE_ONLY" = "0" ] && [ "$MODE_EXPLICIT" = "0" ]; then
+    prev_when="$(stat -c '%y' "$PREVIOUS_REPORT" 2>/dev/null | cut -d' ' -f1)" || prev_when=""
+    [ -n "$prev_when" ] || prev_when="$(stat -f '%Sm' -t '%Y-%m-%d' "$PREVIOUS_REPORT" 2>/dev/null || true)"
+    if [ -t 0 ]; then
+        printf '\n      a report from %s is already here\n' "${prev_when:-an earlier run}"
+        printf '      [Enter] keep it and reassess · [r] rebuild from scratch\n'
+        printf '      choice: '
+        read -r reply || reply=""
+        case "$reply" in
+            r|R|rebuild) SCAN_MODE="rebuild";  ok "rebuilding — the previous model, cache and history are cleared" ;;
+            *)           SCAN_MODE="standard"; ok "reassessing — the previous report is kept" ;;
+        esac
+    else
+        info "a report from ${prev_when:-an earlier run} is already here — reassessing and keeping it; --mode rebuild starts from scratch"
+    fi
+fi
+
 if [ -n "$OUTPUT_REPO" ]; then
     # Settle reachability now. Discovering an unreachable publishing target
     # after a scan that ran for twenty minutes helps nobody.
@@ -970,9 +1028,46 @@ if [ -n "$OUTPUT_REPO" ]; then
             || die "branch '$OUTPUT_REPO_BRANCH' does not exist in $OUTPUT_REPO — create it first, publishing does not open new branches"
     fi
     ok "report will be published to $OUTPUT_REPO in $OUTPUT_REPO_PATH/"
+    [ "${REMOTE_EMPTY:-0}" = "1" ] && detail "the repository is still empty — this run publishes the first report into it"
 fi
 
-# ══════════════════════════════ 5. Scan ══════════════════════════════════════
+# ══════════════════════ 5. Profile the target ════════════════════════════════
+step "Profile target"
+
+# Size, language split, build manifests and how much of the tree git does not
+# track. Deterministic, no model, no network, and no file content is read, so it
+# costs a directory walk. Two invocations because the script renders either text
+# or JSON, never both — the same walk twice.
+#
+# The copy next to this launcher wins, the way appsec-key-from-gitlab.sh does:
+# it makes the profile work with any pinned ADVISOR_REF. It is a copy of the
+# plugin's scripts/repo_profile.py, which is where the file is maintained and
+# tested; the provisioned plugin is the fallback when the companion is absent.
+PROFILE_SCRIPT="$SCRIPT_DIR/repo_profile.py"
+[ -f "$PROFILE_SCRIPT" ] || PROFILE_SCRIPT="$PLUGIN_DIR/scripts/repo_profile.py"
+PROFILE_JSON="$OUTPUT_DIR/.target-profile.json"
+if [ ! -f "$PROFILE_SCRIPT" ]; then
+    # No companion, and a pinned older ADVISOR_REF predates the script in the
+    # plugin. No reason to stop a scan, but it is the whole job of --profile-only.
+    [ "$PROFILE_ONLY" = "1" ] \
+        && die "no repo_profile.py — neither next to this script nor in the provisioned appsec-advisor ($ADVISOR_VERSION)"
+    warn "no repo_profile.py next to this script and none in the provisioned appsec-advisor ($ADVISOR_VERSION) — skipping the profile"
+elif python3 "$PROFILE_SCRIPT" --repo "$TARGET" 2>&1 | sed 's/^\(.\)/      \1/' | tee -a "$LOG_FILE"; then
+    python3 "$PROFILE_SCRIPT" --repo "$TARGET" --json >"$PROFILE_JSON" 2>/dev/null \
+        || warn "could not write $PROFILE_JSON"
+    detail "profile: $PROFILE_JSON"
+else
+    [ "$PROFILE_ONLY" = "1" ] && die "profiling $TARGET failed"
+    warn "profiling the target failed — the scan continues without a profile"
+fi
+
+if [ "$PROFILE_ONLY" = "1" ]; then
+    printf '\n'
+    ok "profile only — no scan was started, nothing was billed"
+    exit 0
+fi
+
+# ══════════════════════════════ 6. Scan ══════════════════════════════════════
 step "Run threat model (headless)"
 
 ARGS=(--repo "$TARGET" --output "$OUTPUT_DIR"
@@ -1015,7 +1110,7 @@ sh "$RUNNER" "${ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
 RC=${PIPESTATUS[0]}
 set -e
 
-# ═══════════════════════════ 6. Result ═══════════════════════════════════════
+# ═══════════════════════════ 7. Result ═══════════════════════════════════════
 step "Result"
 
 if [ "$RC" -eq 0 ]; then
@@ -1041,7 +1136,7 @@ if [ -f "$OUTPUT_DIR/threat-model.yaml" ] && [ -f "$PLUGIN_DIR/scripts/run_summa
     python3 "$PLUGIN_DIR/scripts/run_summary.py" findings "$OUTPUT_DIR/threat-model.yaml" 2>/dev/null || true
 fi
 
-# ══════════════════════ 7. Publish the report ════════════════════════════════
+# ══════════════════════ 8. Publish the report ════════════════════════════════
 if [ -n "$OUTPUT_REPO" ]; then
     step "Publish report to $OUTPUT_REPO"
 
@@ -1049,7 +1144,24 @@ if [ -n "$OUTPUT_REPO" ]; then
     rm -rf "$PUB_DIR"; mkdir -p "$(dirname "$PUB_DIR")"
     pub_clone=(clone --quiet --depth 1)
     [ -n "$OUTPUT_REPO_BRANCH" ] && pub_clone+=(--branch "$OUTPUT_REPO_BRANCH")
-    git_output "${pub_clone[@]}" -- "$OUTPUT_REPO" "$PUB_DIR" || die "cannot clone the output repository: $OUTPUT_REPO"
+    # git warns "You appear to have cloned an empty repository" on stderr. For a
+    # publishing target that is the normal first run, not a problem, and the raw
+    # warning reads like one. Swallow that line, pass everything else through.
+    pub_err="$(mktemp)"
+    if ! git_output "${pub_clone[@]}" -- "$OUTPUT_REPO" "$PUB_DIR" 2>"$pub_err"; then
+        sed 's/^/      /' <"$pub_err" >&2
+        rm -f "$pub_err"
+        die "cannot clone the output repository: $OUTPUT_REPO"
+    fi
+    if grep -q "cloned an empty repository" "$pub_err" 2>/dev/null; then
+        # Step 4 already said so when it checked the remote; saying it twice
+        # makes one harmless fact look like a developing problem.
+        [ "${REMOTE_EMPTY:-0}" = "1" ] \
+            || info "the output repository is empty — this run publishes the first report into it"
+    elif [ -s "$pub_err" ]; then
+        sed 's/^/      /' <"$pub_err" >&2
+    fi
+    rm -f "$pub_err"
 
     PUB_DEST="$PUB_DIR/$OUTPUT_REPO_PATH"
     mkdir -p "$PUB_DEST"
@@ -1062,7 +1174,14 @@ if [ -n "$OUTPUT_REPO" ]; then
         fi
     done
     if [ "$published" -eq 0 ]; then
-        warn "no report artifacts were produced, so there is nothing to publish"
+        # Say which of the two it is. An empty output repository is fine and
+        # says nothing about this; what decides is whether the run produced a
+        # report at all.
+        if [ "$RC" -ne 0 ]; then
+            warn "the scan failed (exit $RC), so no report exists to publish — $OUTPUT_REPO is unchanged"
+        else
+            warn "the run wrote none of $OUTPUT_REPO_FILES, so there is nothing to publish — $OUTPUT_REPO is unchanged"
+        fi
     else
         git -C "$PUB_DIR" add -- "$OUTPUT_REPO_PATH" || die "git add failed in the output clone"
         if git -C "$PUB_DIR" diff --cached --quiet; then
