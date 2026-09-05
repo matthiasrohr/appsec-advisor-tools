@@ -74,6 +74,9 @@ REASONING_MODEL="${REASONING_MODEL:-}"            # opus | opus-cheap | sonnet |
 WITH_SARIF="${WITH_SARIF:-0}"                     # 1 → threat-model.sarif.json
 WITH_THREATDRAGON="${WITH_THREATDRAGON:-0}"       # 1 → threat-model.threatdragon.json (alpha)
 WITH_REQUIREMENTS="${WITH_REQUIREMENTS:-0}"       # 1 → run the requirements check
+# Base URL of the running instance of the target. Set it, and the run also
+# builds the Strix pentest task set for that URL; empty = no pentest tasks.
+PENTEST_URL="${PENTEST_URL:-}"                    # also settable per run with --url
 RUN_QA="${RUN_QA:-1}"                             # 0 → --no-qa (faster, less checked)
 
 # What the run does. Also settable per run with --mode. The compact runtime has
@@ -151,7 +154,7 @@ OUTPUT_REPO="${OUTPUT_REPO:-}"                       # git URL, https or ssh
 OUTPUT_REPO_BRANCH="${OUTPUT_REPO_BRANCH:-}"         # empty = the repo's default branch
 OUTPUT_REPO_PATH="${OUTPUT_REPO_PATH:-}"             # empty = reports/<target-slug>
 OUTPUT_REPO_PUSH="${OUTPUT_REPO_PUSH:-1}"            # 0 = commit locally, do not push
-OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat-model.sarif.json threat-model.threatdragon.json threat-model.pdf threat-model.html}"
+OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat-model.sarif.json threat-model.threatdragon.json threat-model.pdf threat-model.html pentest-tasks.yaml}"
 
 # Write credentials for OUTPUT_REPO. Deliberately separate from the target ones:
 # reading a repository and writing to one are different privileges.
@@ -246,7 +249,12 @@ Options:
   --target-ref  <ref>    Branch, tag or commit for --target-repo
   --output-dir  <dir>    Report directory (default: ./appsec-reports/<target-slug>)
   --output-repo <url>    Publish the finished report into this git repository
-  --context     <src>    Business context for this run: http(s) URL or file path
+  --context     <src>    Business context for this run: http(s) URL or file path.
+                         Without it the run passes --skip-context, so a
+                         docs/business-context.md in the target stays unread.
+  --url         <url>    Base URL of the running target, e.g. http://localhost:3000.
+                         Set it and the run also writes pentest-tasks.yaml
+                         (Strix format) for that URL. Omitted = no pentest tasks.
   --mode        <mode>   standard (default) = full assessment, history preserved
                          rebuild            = clear model, cache and history first
                          rerender           = re-render from existing Stage-1 data
@@ -294,6 +302,7 @@ Plugin and scan:
   SESSION_MODEL=<model>   REASONING_MODEL=<tier>  VERBOSITY=quiet|normal|verbose
   SCAN_MODE=standard|rebuild|rerender             (same as --mode)
   WITH_SARIF=1  WITH_THREATDRAGON=1  WITH_REQUIREMENTS=1  RUN_QA=0
+  PENTEST_URL=<http(s) url>         (same as --url) Strix pentest tasks for that URL
   FAIL_ON=critical|high|medium      MAX_DURATION=<seconds>   MAX_BUDGET=<usd>
 
 Service key (the key value never belongs in this file, only its source):
@@ -323,6 +332,7 @@ while [ $# -gt 0 ]; do
         --output-dir|--output|-o)
                        OUTPUT_DIR="${2:?--output-dir needs a path}";  shift 2 ;;
         --context)     CONTEXT_SRC="${2:?--context needs a URL or a file path}"; shift 2 ;;
+        --url)         PENTEST_URL="${2:?--url needs an http(s) URL}"; shift 2 ;;
         --output-repo) OUTPUT_REPO="${2:?--output-repo needs a git URL}"; shift 2 ;;
         --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; MODE_EXPLICIT=1; shift 2 ;;
         --max-budget)  MAX_BUDGET="${2:?--max-budget needs an amount in USD}"; shift 2 ;;
@@ -412,6 +422,16 @@ if [ -n "$CONTEXT_SRC" ]; then
             case "$CONTEXT_SRC" in
                 *[[:space:]]*) die "the context file's absolute path contains spaces, which the plugin's --context cannot carry: $CONTEXT_SRC" ;;
             esac ;;
+    esac
+fi
+
+# The URL travels to the skill as one word in a whitespace-joined flag string,
+# so anything the shell would split apart has to be refused here.
+if [ -n "$PENTEST_URL" ]; then
+    case "$PENTEST_URL" in
+        *[[:space:]]*)      die "--url must not contain spaces (got: $PENTEST_URL)" ;;
+        https://?*|http://?*) : ;;
+        *)                  die "--url takes an http(s) URL of the running target, e.g. http://localhost:3000 (got: $PENTEST_URL)" ;;
     esac
 fi
 
@@ -1195,7 +1215,11 @@ if [ "$DISCARD_STAGE1" = "1" ]; then ARGS+=(--force); fi
 [ -n "$MAX_DURATION" ]          && ARGS+=(--max-duration "$MAX_DURATION")
 [ -n "$MAX_BUDGET" ]            && ARGS+=(--max-budget "$MAX_BUDGET")
 [ -n "$FAIL_ON" ]               && ARGS+=(--fail-on "$FAIL_ON")
-[ -n "$CONTEXT_SRC" ]           && ARGS+=(--context "$CONTEXT_SRC")
+# No context source, no context: --skip-context settles it for the run instead
+# of leaving the analysis to pick up whatever docs/business-context.md the
+# target repository happens to carry.
+if [ -n "$CONTEXT_SRC" ]; then ARGS+=(--context "$CONTEXT_SRC"); else ARGS+=(--skip-context); fi
+[ -n "$PENTEST_URL" ]           && ARGS+=(--pentest-tasks --pentest-format strix --pentest-target "$PENTEST_URL")
 [ "$VERBOSITY" = "quiet" ]      && ARGS+=(--quiet)
 [ "$VERBOSITY" = "verbose" ]    && ARGS+=(--verbose)
 ARGS+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
@@ -1230,7 +1254,8 @@ fi
 printf '\n      %sArtifacts in %s%s\n' "$C_DIM" "$OUTPUT_DIR" "$C_NC"
 found_any=0
 for name in threat-model.md threat-model.yaml threat-model.sarif.json \
-            threat-model.threatdragon.json threat-model.pdf threat-model.html run.log; do
+            threat-model.threatdragon.json threat-model.pdf threat-model.html \
+            pentest-tasks.yaml run.log; do
     f="$OUTPUT_DIR/$name"
     if [ -f "$f" ]; then
         found_any=1
