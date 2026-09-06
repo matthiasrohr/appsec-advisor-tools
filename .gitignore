@@ -1,0 +1,9 @@
+# appsec-advisor: assessment output — publish deliberately via
+# /appsec-advisor:publish-threat-model or --output-repo
+appsec-reports/
+
+# appsec-advisor: assessment output — publish deliberately via /appsec-advisor:publish-threat-model
+appsec-reports/insecure-python-app/**
+
+# appsec-advisor: assessment output — publish deliberately via /appsec-advisor:publish-threat-model
+appsec-reports/juice-shop/**
