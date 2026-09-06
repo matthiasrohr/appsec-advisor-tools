@@ -15,7 +15,10 @@ an interactive Claude Code session. No package, no build step, no test suite.
 - `repo_profile.py` — what a scan would read, before it costs anything.
 - `README.md` — the user-facing documentation. A change to a flag, a default or
   a configuration variable is not finished until it is in there.
-- `ci/gitlab/` — the launcher as a GitLab pipeline, and the image it runs in.
+- `ci/gitlab/` and `.github/workflows/threat-model.yml` — the launcher as a
+  pipeline on either host, started by hand and never on a push. GitHub reads
+  workflows only from `.github/workflows`; the GitLab file sits in a
+  subdirectory because GitLab takes a configurable path.
   The job passes everything through the environment, so a new setting is
   available there the moment the CONFIGURATION block has it; add it to the
   pipeline's `variables:` only when a caller should see it in the form.

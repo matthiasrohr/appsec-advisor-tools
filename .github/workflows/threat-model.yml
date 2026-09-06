@@ -1,0 +1,104 @@
+# Threat model as a GitHub workflow, the counterpart of
+# ci/gitlab/threat-model.gitlab-ci.yml. It lives here and nowhere else: GitHub
+# only runs workflows from .github/workflows, the path is not configurable.
+#
+# workflow_dispatch is the only trigger, so nothing starts by itself. The form
+# appears under Actions → Threat model → Run workflow, once this file is on the
+# default branch — GitHub reads dispatchable workflows from there.
+#
+# Two secrets, under Settings → Secrets and variables → Actions:
+#   ANTHROPIC_API_KEY   a run here is billed per token; there is no subscription
+#                       in CI, which is what soft_budget is for
+#   REPORT_REPO_TOKEN   pushes into the report repository. GITHUB_TOKEN cannot:
+#                       it is scoped to this repository. A fine-grained token
+#                       needs Contents: read and write there, and Administration:
+#                       read and write only if it has to create the repository
+name: Threat model
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Repository to scan, e.g. https://github.com/juice-shop/juice-shop"
+        required: true
+      target_ref:
+        description: "Branch, tag or commit of the target. Empty = its default branch"
+        required: false
+        default: ""
+      output_repo:
+        description: "Where the report is published, under reports/<owner>/<name>"
+        required: false
+        default: "https://github.com/matthiasrohr/juice-shop-test"
+      advisor_ref:
+        description: "Plugin version: latest, dev, a tag or a commit"
+        required: false
+        default: "dev"
+      assessment_depth:
+        description: "How deep the analysis goes"
+        type: choice
+        options: ["quick", "standard", "thorough"]
+        default: "quick"
+      soft_budget:
+        description: "Steer the run to this many USD. A projection that cannot fit refuses the run"
+        required: false
+        default: "30"
+      create_output_repo:
+        description: "Create the report repository when it is missing — after the scan, so a failed run leaves nothing behind"
+        type: boolean
+        default: true
+      profile_only:
+        description: "Measure the target and stop: no model, no credential, no cost. The cheapest way to test this workflow"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read          # the report goes to another repository, with its own token
+
+jobs:
+  threat-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      # Pinned to commits rather than tags: a tag can be moved to other code,
+      # a commit cannot.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+
+      - name: Install what the launcher checks for
+        run: |
+          npm install -g @anthropic-ai/claude-code@latest
+          python3 -m pip install --quiet pyyaml jsonschema
+          claude --version
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830      # v4
+        with:
+          path: ~/.cache/appsec-advisor
+          key: appsec-advisor-${{ inputs.advisor_ref }}
+
+      # Everything reaches the run through the environment, which is why the
+      # command below is the launcher's name and nothing else.
+      - name: Run the assessment
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_REF: ${{ inputs.target_ref }}
+          OUTPUT_REPO: ${{ inputs.profile_only && '' || inputs.output_repo }}
+          OUTPUT_REPO_CREATE: ${{ inputs.create_output_repo && '1' || '0' }}
+          PROFILE_ONLY: ${{ inputs.profile_only && '1' || '0' }}
+          ADVISOR_REF: ${{ inputs.advisor_ref }}
+          ASSESSMENT_DEPTH: ${{ inputs.assessment_depth }}
+          SOFT_BUDGET: ${{ inputs.soft_budget }}
+          MAX_DURATION: "9000"
+          OUTPUT_DIR: ${{ github.workspace }}/report
+          SAVE_CONSOLE_LOG: "1"
+          ASSUME_YES: "1"
+          KEY_SOURCE: env
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OUTPUT_GIT_TOKEN: ${{ secrets.REPORT_REPO_TOKEN }}
+          OUTPUT_GIT_USER: x-access-token
+        run: ./create-threat-model.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        if: always()          # a failed run still has its log, and often a report
+        with:
+          name: threat-model
+          path: report/
+          retention-days: 30
