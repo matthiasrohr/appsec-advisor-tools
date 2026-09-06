@@ -461,6 +461,13 @@ HELP
 }
 
 # ── Arguments ────────────────────────────────────────────────────────────────
+# What the shell actually handed over, kept before the parser consumes it. A
+# command line that lost a line to a missing backslash arrives here short, and
+# every symptom after that — a report in the wrong directory, no publishing, a
+# step count that does not add up — is a consequence nobody connects back to it.
+# So the run states its own arguments, once, before it does anything with them.
+INVOCATION="$(printf '%q ' "$0" "$@")"; INVOCATION="${INVOCATION% }"
+
 TARGET_DIR=""; TARGET_REPO=""; TARGET_REF=""; OUTPUT_DIR=""; PROFILE_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -1058,6 +1065,7 @@ step "Preflight"
 CLAUDE_EXECUTABLE="${APPSEC_CLAUDE_EXECUTABLE:-claude}"
 command -v git >/dev/null 2>&1 || die "git not found"
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
+detail "$INVOCATION"
 ok "git $(git --version | awk '{print $3}'), python3 $(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')"
 pf_pass tools "git $(git --version | awk '{print $3}') · python3 $(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')"
 
