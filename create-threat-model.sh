@@ -553,6 +553,7 @@ save_console_log() {
     cp -f "$CONSOLE_TMP" "$CONSOLE_LOG" 2>/dev/null || return 0
 }
 on_exit() {
+    [ -n "${HOST_API_HEADER_FILE:-}" ] && rm -f "$HOST_API_HEADER_FILE"
     save_console_log
     if [ -n "$CONSOLE_TMP" ] && [ -z "$CONSOLE_LOG" ]; then
         printf '      console log: %s\n' "$CONSOLE_TMP" >&2
@@ -851,11 +852,24 @@ git_output() { git_auth "$OUTPUT_GIT_USER" "$OUTPUT_GIT_TOKEN" "$@"; }
 
 # One request to a repository host's API, with the token in curl's config on
 # stdin so it stays out of the process list. Prints "<body>\n<http status>".
+# The response headers of the last call, so a refusal can be explained with what
+# the host says about the token rather than with a guess about it. The path is
+# set by the caller, not here: host_api runs inside a command substitution, and
+# a variable this function assigns dies with that subshell. The file does not.
+HOST_API_HEADER_FILE=""
+api_header() {  # api_header <name> — prints the value, returns 1 when not sent
+    local line
+    [ -n "$HOST_API_HEADER_FILE" ] && [ -f "$HOST_API_HEADER_FILE" ] || return 1
+    line="$(tr -d '\r' <"$HOST_API_HEADER_FILE" | grep -i "^$1:" | tail -1)" || return 1
+    printf '%s' "${line#*: }"
+}
+
 host_api() {  # host_api <method> <url> <header name> <token> [<json body>]
     local method="$1" url="$2" hdr="$3" token="$4" data="${5:-}" args=()
     args=(--silent --show-error --location --max-time "$KEY_FETCH_TIMEOUT"
           --request "$method" --write-out '\n%{http_code}'
           --header 'Accept: application/json')
+    [ -n "${HOST_API_HEADER_FILE:-}" ] && args+=(--dump-header "$HOST_API_HEADER_FILE")
     [ -n "$data" ] && args+=(--header 'Content-Type: application/json' --data "$data")
     printf 'header = "%s: %s"\n' "$hdr" "$token" | curl "${args[@]}" --config - -- "$url"
 }
@@ -871,8 +885,11 @@ except Exception: print("")' "$1" 2>/dev/null
 # Create the output repository on its host. Only reached with an explicit
 # --create-output-repo, and only when the repository is not there.
 create_output_repo() {  # create_output_repo <url>
-    local url="$1" host path owner name kind token api data out code body msg ns_id
+    local url="$1" host path owner name kind token api data out code body msg ns_id hint scopes accepts
     command -v curl >/dev/null 2>&1 || die "creating a repository needs curl"
+    # One file for the whole exchange; each call overwrites it, so what is read
+    # after a refusal are the headers of the call that was refused.
+    HOST_API_HEADER_FILE="$CACHE_DIR/.api-response-headers"
     token="$OUTPUT_GIT_TOKEN"
     [ -n "$token" ] || die "creating $url needs OUTPUT_GIT_TOKEN or OUTPUT_GIT_TOKEN_FILE — a repository is made through the host's API, not through git, and that is a wider permission than pushing"
 
@@ -940,7 +957,27 @@ create_output_repo() {  # create_output_repo <url>
                 *)  msg="$(printf '%s' "$body" | json_field message)"
                     die "the host refused to create $url (HTTP $code)${msg:+: $msg}" ;;
             esac ;;
-        401|403) die "the token may not create repositories in '$owner' (HTTP $code) — pushing and creating are separate permissions" ;;
+        401|403)
+            msg="$(printf '%s' "$body" | json_field message)"
+            if [ "$kind" = "github" ]; then
+                # A classic token gets its scopes back in the headers, and the
+                # endpoint says which ones it would have accepted — that beats
+                # any list this script could carry. A fine-grained token sends
+                # no such header, and is a different permission model.
+                if scopes="$(api_header x-oauth-scopes)"; then
+                    hint="this token carries: ${scopes:-no scopes at all}"
+                    accepts="$(api_header x-accepted-oauth-scopes)" || accepts=""
+                    [ -n "$accepts" ] && hint="$hint · the endpoint accepts: $accepts"
+                    hint="$hint · a private repository needs 'repo'"
+                else
+                    hint="no scope header came back, so this is a fine-grained token or an app: it needs 'Administration: read and write' on '$owner', and an organization must allow the token in the first place"
+                fi
+            else
+                hint="creating a project needs the 'api' scope and an account that may create projects in '$owner'"
+            fi
+            die "the token may not create repositories in '$owner' (HTTP $code)${msg:+ — $msg}
+      pushing and creating are separate permissions.
+      $hint" ;;
         404)     die "the owner '$owner' does not exist on $host, or the token cannot see it (HTTP 404)" ;;
         *)       msg="$(printf '%s' "$body" | json_field message)"
                  die "creating $url failed (HTTP $code)${msg:+: $msg}" ;;
