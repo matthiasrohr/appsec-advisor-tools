@@ -1011,6 +1011,16 @@ check_remote_repo() {  # check_remote_repo <url> <description> [none|target|outp
     esac
     case "$text" in
         *"not found"*|*"Not Found"*|*"does not appear to be a git repository"*)
+            # A repository this run created seconds ago exists, whatever git
+            # says: the host answered 201 for it. GitHub answers 404 for a
+            # private repository the credentials may not see, so "not found"
+            # here is about the credentials, and saying "does not exist" would
+            # send someone looking for the wrong thing.
+            [ "${REMOTE_CREATED:-0}" = "1" ] && die "$url was created through the host's API just now, so it exists — but git cannot see it with these credentials:
+      · the account name in use is '${OUTPUT_GIT_USER:-}' — GitHub wants x-access-token here, GitLab oauth2
+      · a fine-grained token limited to selected repositories does not cover one created after it was issued; give it access to the new repository, or use a token with the 'repo' scope
+      · an ssh URL (git@…) avoids the question — that push travels on your key
+      The repository stays; the next run does not need --create-output-repo"
             die "$what does not exist, or the credentials in use cannot see it: $url" ;;
         *"could not read Username"*|*"terminal prompts disabled"*)
             # A private and a missing repository look identical over https: the
