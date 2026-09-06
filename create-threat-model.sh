@@ -1103,19 +1103,42 @@ provision_official() {
         git clone --quiet -- "$ADVISOR_REPO_URL" "$PLUGIN_DIR" || die "git clone failed for $ADVISOR_REPO_URL"
     fi
 
-    local want="$ADVISOR_REF" sha=""
+    local want="$ADVISOR_REF" sha="" kind="commit"
     if [ "$want" = "latest" ]; then
         want="$(newest_tag "$PLUGIN_DIR")" || die "ADVISOR_REF=latest, but the repository has no v* tag"
         case "$want" in *-*) warn "no stable release tag yet — using pre-release $want" ;; esac
     fi
     sha="$(git -C "$PLUGIN_DIR" rev-parse -q --verify "refs/tags/$want^{commit}" 2>/dev/null || true)"
-    [ -n "$sha" ] || sha="$(git -C "$PLUGIN_DIR" rev-parse -q --verify "refs/remotes/origin/$want^{commit}" 2>/dev/null || true)"
+    if [ -n "$sha" ]; then
+        kind="tag"
+    else
+        sha="$(git -C "$PLUGIN_DIR" rev-parse -q --verify "refs/remotes/origin/$want^{commit}" 2>/dev/null || true)"
+        if [ -n "$sha" ]; then kind="branch"; fi
+    fi
     [ -n "$sha" ] || sha="$(git -C "$PLUGIN_DIR" rev-parse -q --verify "$want^{commit}" 2>/dev/null || true)"
     [ -n "$sha" ] || die "ADVISOR_REF '$ADVISOR_REF' is not a tag, branch or commit in $ADVISOR_REPO_URL"
 
     git -C "$PLUGIN_DIR" checkout --quiet --detach "$sha"
     git -C "$PLUGIN_DIR" reset --quiet --hard "$sha"
-    ADVISOR_VERSION="$want ($(git -C "$PLUGIN_DIR" rev-parse --short HEAD))"
+
+    # Which plugin this is, and how old it is. A ref alone does not say that:
+    # "dev" is a moving target and a tag says nothing about when it was cut, so
+    # a run that behaves oddly cannot be placed against the plugin's history.
+    # A release is dated by its tag — the annotated tag carries the date the
+    # release was made, which is the one a changelog names; a lightweight tag
+    # has none and falls back to the commit it points at. A branch is dated by
+    # its last commit, and named by the release it builds on.
+    local short when release
+    short="$(git -C "$PLUGIN_DIR" rev-parse --short HEAD)"
+    when="$(git -C "$PLUGIN_DIR" log -1 --format=%cd --date=short "$sha" 2>/dev/null || true)"
+    if [ "$kind" = "tag" ]; then
+        release="$(git -C "$PLUGIN_DIR" for-each-ref --format='%(taggerdate:short)' "refs/tags/$want" 2>/dev/null || true)"
+        if [ -n "$release" ]; then when="$release"; fi
+        ADVISOR_VERSION="$want · released ${when:-date unknown} ($short)"
+    else
+        release="$(git -C "$PLUGIN_DIR" describe --tags --abbrev=0 "$sha" 2>/dev/null || true)"
+        ADVISOR_VERSION="$want · last commit ${when:-date unknown}${release:+ · after $release} ($short)"
+    fi
 }
 
 provision_local() {
@@ -1157,7 +1180,12 @@ provision_local() {
     fi
     PLUGIN_DIR="$(cd "$PLUGIN_DIR" && pwd)"
     if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-        ADVISOR_VERSION="local checkout ($(git -C "$PLUGIN_DIR" describe --tags --always --dirty 2>/dev/null || echo 'unknown'))"
+        # Same question as for a cloned ref, and the same answer: what is
+        # checked out here, and from when.
+        local desc when
+        desc="$(git -C "$PLUGIN_DIR" describe --tags --always --dirty 2>/dev/null || echo 'unknown')"
+        when="$(git -C "$PLUGIN_DIR" log -1 --format=%cd --date=short 2>/dev/null || true)"
+        ADVISOR_VERSION="local checkout $desc${when:+ · last commit $when}"
     else
         ADVISOR_VERSION="local package"
     fi
