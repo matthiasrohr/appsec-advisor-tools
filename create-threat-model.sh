@@ -209,7 +209,10 @@ OUTPUT_GIT_USER="${OUTPUT_GIT_USER:-oauth2}"
 OUTPUT_GIT_NAME="${OUTPUT_GIT_NAME:-appsec-advisor}"
 OUTPUT_GIT_EMAIL="${OUTPUT_GIT_EMAIL:-appsec-advisor@localhost}"
 # Parent directory for the report when --output-dir is omitted. OUTPUT_BASE is
-# the earlier name for this and still works.
+# the earlier name for this and still works. Whether it was set at all decides
+# where a publishing run writes — see step 4 — so the answer is kept before the
+# default hides it.
+if [ -n "${OUTPUT_DIR_BASE:-}${OUTPUT_BASE:-}" ]; then OUTPUT_DIR_BASE_SET=1; else OUTPUT_DIR_BASE_SET=0; fi
 OUTPUT_DIR_BASE="${OUTPUT_DIR_BASE:-${OUTPUT_BASE:-$PWD/appsec-reports}}"
 
 # ════════════════════════ end of configuration ══════════════════════════════
@@ -326,7 +329,9 @@ Options:
   --target-dir  <path>   Local directory to scan
   --target-repo <url>    Git repository to clone and scan (https://, ssh:// or git@)
   --target-ref  <ref>    Branch, tag or commit for --target-repo
-  --output-dir  <dir>    Report directory (default: ./appsec-reports/<target-slug>)
+  --output-dir  <dir>    Report directory (default: ./appsec-reports/<target-slug>,
+                         and with --output-repo the cache instead, because the
+                         report is then read from the repository)
   --output-repo <url>    Publish the finished report into this git repository
   --create-output-repo   Create --output-repo on its host when it is not there,
                          without asking. Always private. Needs OUTPUT_GIT_TOKEN
@@ -389,7 +394,11 @@ Plugin and scan:
   TARGET_GIT_TOKEN=…   TARGET_GIT_TOKEN_FILE=<chmod 600>   TARGET_GIT_USER=oauth2
       credentials for a private --target-repo over https (GitLab PAT, project or
       group token; GitHub: TARGET_GIT_USER=x-access-token). ssh URLs use your key.
-  OUTPUT_DIR_BASE=<dir>  parent of the report directory when --output-dir is omitted
+  OUTPUT_DIR_BASE=<dir>  parent of the report directory when --output-dir is
+      omitted. Default ./appsec-reports, except when the run publishes: then the
+      scan works in <cache>/reports/<target-slug>, one directory per target so
+      model, changelog and finding ids survive to the next run. Setting this
+      brings the named directory back for a publishing run too
   OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>  OUTPUT_REPO_PATH=reports/<slug>
   OUTPUT_REPO_CREATE=1   (same as --create-output-repo) create it when missing,
       always private   OUTPUT_REPO_HOST=auto|github|gitlab  which API to use;
@@ -1296,7 +1305,27 @@ fi
 # ══════════════════════ 4. Prepare the output directory ══════════════════════
 step "Prepare output directory"
 
-[ -n "$OUTPUT_DIR" ] || OUTPUT_DIR="$OUTPUT_DIR_BASE/$SLUG"
+# A run that publishes reads its report from the output repository, not from
+# here: the local directory is where the scan works and where the publish step
+# copies from. Leaving that in whatever directory the run was started from puts
+# a few hundred intermediates into someone's working repository for no one's
+# benefit, so a publishing run works next to the caches instead — unless a path
+# was named, in which case the named path wins, as always.
+#
+# Still one directory per target and not a fresh one per run: that directory
+# carries the model, the changelog and the finding IDs from one assessment of a
+# target to the next. A new directory every time would publish a first report
+# every time — new IDs, no changelog, nothing to compare against — and would
+# leave the reports of failed runs scattered under names nobody knows.
+OUTPUT_DIR_STAGING=0
+if [ -z "$OUTPUT_DIR" ]; then
+    if [ -n "$OUTPUT_REPO" ] && [ "$OUTPUT_DIR_BASE_SET" = "0" ]; then
+        OUTPUT_DIR="$CACHE_DIR/reports/$SLUG"
+        OUTPUT_DIR_STAGING=1
+    else
+        OUTPUT_DIR="$OUTPUT_DIR_BASE/$SLUG"
+    fi
+fi
 mkdir -p "$OUTPUT_DIR" || die "cannot create output directory: $OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 LOG_FILE="$OUTPUT_DIR/run.log"
@@ -1333,6 +1362,9 @@ if [ "$SCAN_MODE" = "rerender" ]; then
 fi
 
 ok "$OUTPUT_DIR"
+if [ "$OUTPUT_DIR_STAGING" = "1" ]; then
+    detail "this run publishes, so the scan works outside the current directory — --output-dir or OUTPUT_DIR_BASE overrides that"
+fi
 pf_pass target "$TARGET"
 pf_pass "output dir" "$OUTPUT_DIR"
 detail "log: $LOG_FILE"

@@ -25,6 +25,8 @@ ASSESSMENT_DEPTH=thorough WITH_SARIF=1 FAIL_ON=high ./create-threat-model.sh --t
 
 The report lands in `./appsec-reports/<target-slug>/` unless `--output-dir` says otherwise: `threat-model.md` and `threat-model.yaml`, the SARIF, Threat Dragon, PDF and HTML variants where the run was asked for them, `pentest-tasks.yaml` when `--url` named a running instance, and `run.log`. That directory is git-ignored in this repository.
 
+A run with `--output-repo` reads its report from that repository, so the local directory is only where the scan works and the publish step copies from. It moves to `<cache>/reports/<target-slug>` for that reason, and the current directory stays clean. Still one directory per target and not a fresh one per run: it carries the model, the changelog and the finding IDs from one assessment of a target to the next, and a run that dies after the scan leaves its report somewhere findable. `--output-dir` or `OUTPUT_DIR_BASE` names the directory yourself, publishing or not.
+
 `--help` lists the options, `--help config` every configuration variable.
 
 ### A run with everything spelled out
