@@ -1,0 +1,96 @@
+# Threat model as a GitLab pipeline. One variable has to be filled in — the
+# repository to scan — and everything else has a default that this file states.
+#
+# Point GitLab at it under Settings → CI/CD → CI/CD configuration file:
+#     ci/gitlab/threat-model.gitlab-ci.yml
+# or include it from the pipeline you already have:
+#     include:
+#       - project: <group>/appsec-advisor-tools
+#         file: ci/gitlab/threat-model.gitlab-ci.yml
+#
+# Run it from CI/CD → Pipelines → Run pipeline: the variables below appear as a
+# form, prefilled with these values.
+#
+# Two things this file cannot supply:
+#   · the image. It needs the Claude Code CLI (Node) and python3 with pyyaml and
+#     jsonschema. ci/gitlab/Dockerfile builds one.
+#   · ANTHROPIC_API_KEY, as a masked and protected CI/CD variable. A pipeline has
+#     no Claude subscription, so a run here is billed per token — which is what
+#     SOFT_BUDGET is for.
+
+variables:
+  TARGET_REPO:
+    value: ""
+    description: "Repository to scan, e.g. https://github.com/juice-shop/juice-shop. The only value this pipeline needs."
+  TARGET_REF:
+    value: ""
+    description: "Branch, tag or commit of the target. Empty = its default branch."
+  OUTPUT_REPO:
+    value: "https://github.com/matthiasrohr/juice-shop-test"
+    description: "Where the finished report is published, under reports/<owner>/<name>."
+  ADVISOR_REF:
+    value: "dev"
+    description: "Plugin version to run: latest (newest release), dev, a tag or a commit."
+  ASSESSMENT_DEPTH:
+    value: "quick"
+    options: ["quick", "standard", "thorough"]
+    description: "How deep the analysis goes. quick is the shallowest and the cheapest."
+  SOFT_BUDGET:
+    value: "30"
+    description: "Steer the run to this many USD. A projection that cannot fit refuses the run; an overrun still finishes."
+  MAX_DURATION:
+    value: "5400"
+    description: "Abort the run after this many seconds."
+  ADVISOR_REPO_URL:
+    value: "https://github.com/appsec-foundry/appsec-advisor"
+    description: "Where the plugin is cloned from. Change it for a fork or a mirror."
+  OUTPUT_REPO_CREATE:
+    value: "1"
+    options: ["1", "0"]
+    description: "Create the report repository when it does not exist — after the scan, so a failed run leaves nothing behind. Needs a token that may create repositories."
+  WITH_SARIF:
+    value: "0"
+    options: ["0", "1"]
+    description: "Also write threat-model.sarif.json."
+  FAIL_ON:
+    value: ""
+    options: ["", "critical", "high", "medium"]
+    description: "Fail the job on new findings at this level or above. Empty = report only."
+
+threat-model:
+  stage: test
+  image: $CI_REGISTRY_IMAGE/appsec-advisor:latest
+  timeout: 3h
+  variables:
+    KEY_SOURCE: env              # ANTHROPIC_API_KEY comes from the CI/CD variables
+    SAVE_CONSOLE_LOG: "1"        # keep this job's own output next to the report
+    ASSUME_YES: "1"              # a pipeline answers no questions
+    APPSEC_ADVISOR_CACHE: "$CI_PROJECT_DIR/.cache/appsec-advisor"
+    OUTPUT_DIR: "$CI_PROJECT_DIR/report"
+    OUTPUT_GIT_USER: x-access-token   # GitHub wants this name, GitLab oauth2
+    GIT_STRATEGY: clone
+  cache:
+    key: appsec-advisor-$ADVISOR_REF
+    paths:
+      - .cache/appsec-advisor      # the plugin clone, so every run does not refetch it
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"        # started from the Run pipeline form
+    - if: $CI_PIPELINE_SOURCE == "schedule"   # or nightly, with its own variables
+  before_script:
+    - test -n "$TARGET_REPO" || { echo "TARGET_REPO is empty — name the repository to scan"; exit 1; }
+    - test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY is not set — add it as a masked, protected CI/CD variable"; exit 1; }
+    # OUTPUT_GIT_TOKEN is what pushes into the report repository, and what
+    # creates it where OUTPUT_REPO_CREATE=1. On GitHub a fine-grained token
+    # needs Contents: read and write on that repository, and Administration:
+    # read and write only if it has to create it. An ssh OUTPUT_REPO needs a key
+    # instead, through GIT_SSH_COMMAND, and no token at all.
+    - test -n "$OUTPUT_GIT_TOKEN$GIT_TOKEN" || echo "warning - no OUTPUT_GIT_TOKEN: publishing will only work if the runner has git credentials of its own for $OUTPUT_REPO"
+  script:
+    # Every other value reaches the run through the environment, which is why
+    # this line never changes. --help config lists all of them.
+    - ./create-threat-model.sh
+  artifacts:
+    when: always                 # a failed run still has its log, and often a report
+    expire_in: 30 days
+    paths:
+      - report/
