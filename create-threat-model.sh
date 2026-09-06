@@ -449,7 +449,13 @@ Plugin and scan:
       the start of every such run, so it starts from nothing every time: no
       earlier model, no changelog, new finding ids. Setting this, or
       --output-dir, brings a stable directory back
-  OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>  OUTPUT_REPO_PATH=reports/<slug>
+  OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>
+  OUTPUT_REPO_PATH=reports/<owner>/<name>   where the report lands in that
+      repository; the default carries the target's owner, so two repositories of
+      the same name in different organizations do not overwrite each other
+  TARGET_REPO=<url>  TARGET_DIR=<path>  TARGET_REF=<ref>  OUTPUT_DIR=<dir>
+      the same as --target-repo, --target-dir, --target-ref and --output-dir,
+      for a caller that has variables rather than a command line
   OUTPUT_REPO_CREATE=1   (same as --create-output-repo) create it when missing,
       always private   OUTPUT_REPO_HOST=auto|github|gitlab  which API to use;
       auto reads github.com as GitHub and everything else as GitLab
@@ -502,7 +508,12 @@ HELP
 # So the run states its own arguments, once, before it does anything with them.
 INVOCATION="$(printf '%q ' "$0" "$@")"; INVOCATION="${INVOCATION% }"
 
-TARGET_DIR=""; TARGET_REPO=""; TARGET_REF=""; OUTPUT_DIR=""; PROFILE_ONLY=0
+# The flags below take their default from the environment like every setting in
+# the CONFIGURATION block does. A pipeline that exposes the run as variables can
+# then pass a target without building a command line for it, and one variable —
+# TARGET_REPO or TARGET_DIR — is all a caller has to fill in.
+TARGET_DIR="${TARGET_DIR:-}"; TARGET_REPO="${TARGET_REPO:-}"; TARGET_REF="${TARGET_REF:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"; PROFILE_ONLY="${PROFILE_ONLY:-0}"
 while [ $# -gt 0 ]; do
     # --flag=value is what everyone types, and refusing it teaches nobody
     # anything: split it and let the same case arm handle both spellings.
@@ -695,7 +706,29 @@ raw_name="${TARGET_DIR:-$TARGET_REPO}"
 raw_name="${raw_name%/}"; raw_name="${raw_name##*/}"; raw_name="${raw_name%.git}"
 SLUG="$(printf '%s' "$raw_name" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
 [ -n "$SLUG" ] || SLUG="target"
-[ -n "$OUTPUT_REPO_PATH" ] || OUTPUT_REPO_PATH="reports/$SLUG"
+
+# Where the report lands in the report repository. Two repositories called
+# "api" in different organizations are two different systems, and a path built
+# from the name alone puts their reports on top of each other — so the default
+# carries the owner as well, group nesting and all. Each segment is filtered the
+# same way the slug is; nothing from a URL reaches a path unfiltered.
+if [ -z "$OUTPUT_REPO_PATH" ]; then
+    OUTPUT_REPO_PATH="reports/$SLUG"
+    if [ -n "$TARGET_REPO" ]; then
+        repo_path="$TARGET_REPO"
+        case "$repo_path" in
+            *://*) repo_path="${repo_path#*://}"; repo_path="${repo_path#*@}"; repo_path="${repo_path#*/}" ;;
+            *@*:*) repo_path="${repo_path#*:}" ;;
+        esac
+        repo_path="${repo_path%.git}"; repo_path="${repo_path%/}"
+        owner_path=""
+        case "$repo_path" in
+            */*) owner_path="$(printf '%s' "${repo_path%/*}" \
+                    | tr -c 'A-Za-z0-9._/-' '-' | sed 's#/\{2,\}#/#g; s#^[/-]*##; s#[/-]*$##; s#\.\.#-#g')" ;;
+        esac
+        [ -n "$owner_path" ] && OUTPUT_REPO_PATH="reports/$owner_path/$SLUG"
+    fi
+fi
 [ -n "$OUTPUT_REPO" ] && TOTAL_STEPS=8
 # Preflight, plugin, target, output directory, profile — and then nothing.
 [ "$PROFILE_ONLY" = "1" ] && TOTAL_STEPS=5

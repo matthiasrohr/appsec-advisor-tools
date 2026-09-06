@@ -48,7 +48,7 @@ WITH_REQUIREMENTS=1 \
 - `WITH_REQUIREMENTS=1` — grade the findings against the plugin's requirements catalog. There is no launcher flag for it; the variable passes `--requirements` to the run.
 - `--target-repo <url>` — clone and scan that repository, here at its default branch.
 - `--url http://localhost:3000` — where the target runs. The scan stays static; the URL only ends up in `pentest-tasks.yaml`.
-- `--output-repo <url>` — publish the artifacts there, under `reports/<target-slug>`.
+- `--output-repo <url>` — publish the artifacts there, under `reports/<owner>/<name>` taken from the target URL; `OUTPUT_REPO_PATH` names it yourself.
 - `--create-output-repo` — create it, private, when it is missing, once the report is finished; a run that fails leaves no repository behind. Needs `OUTPUT_GIT_TOKEN` with creation rights.
 - `--console-log` — keep the script's own output as `console.log` and publish it too.
 - `--soft-budget 30` — steer the run to $30: one that cannot fit does not start, one that overruns still finishes. `--hard-budget` is the cut that kills the session, API billing only, and the runner derives it at 1.25 × the soft budget.
@@ -104,7 +104,7 @@ Where both live in the same place, one credential does: `GIT_TOKEN`, `GIT_TOKEN_
 
 ### Publishing
 
-`--output-repo <url>` copies the finished artifacts into a clone of that repository and commits them under `reports/<target-slug>`, which `OUTPUT_REPO_PATH` can change. The scan itself always runs into the local output directory, so transient run files stay out of the published report. `OUTPUT_REPO_PUSH=0` commits without pushing.
+`--output-repo <url>` copies the finished artifacts into a clone of that repository and commits them under `reports/<owner>/<name>`, taken from the target URL so that two repositories of the same name in different organizations do not overwrite each other; `OUTPUT_REPO_PATH` can change it. The scan itself always runs into the local output directory, so transient run files stay out of the published report. `OUTPUT_REPO_PUSH=0` commits without pushing.
 
 ## Trust mode
 
