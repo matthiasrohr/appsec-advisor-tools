@@ -985,6 +985,27 @@ create_output_repo() {  # create_output_repo <url>
     esac
 }
 
+# Ask receive-pack whether it would take a write, without offering one: a dry-run
+# deletion of a branch name that does not exist. The host answers the permission
+# question at the connection, before any ref is looked at, and there is nothing
+# here that could change the repository even without --dry-run. Reading talks to
+# upload-pack and says nothing about this.
+push_probe() {  # push_probe <url> with-token|without-token — prints the answer
+    local url="$1" mode="$2" dir out text
+    dir="$(mktemp -d)"; out="$(mktemp)"
+    git init --quiet "$dir"
+    if [ "$mode" = "with-token" ]; then
+        GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output -C "$dir" push --dry-run \
+            -- "$url" ":refs/heads/appsec-advisor-write-probe" >"$out" 2>&1 || :
+    else
+        GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" GIT_TERMINAL_PROMPT=0 run_bounded git -C "$dir" push --dry-run \
+            -- "$url" ":refs/heads/appsec-advisor-write-probe" >"$out" 2>&1 || :
+    fi
+    text="$(tr -d '\r' <"$out" | tr '\n' ' ')"
+    rm -rf "$dir" "$out"
+    printf '%s' "$text"
+}
+
 # Is the remote there, and may we read it? Answered before a clone starts.
 check_remote_repo() {  # check_remote_repo <url> <description> [none|target|output] [allow-empty]
     local url="$1" what="$2" creds="${3:-none}" allow_empty="${4:-0}" err rc=0 text
@@ -1728,22 +1749,30 @@ if [ -n "$OUTPUT_REPO" ]; then
         GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output ls-remote --exit-code --heads -- "$OUTPUT_REPO" "$OUTPUT_REPO_BRANCH" >/dev/null 2>&1 \
             || die "branch '$OUTPUT_REPO_BRANCH' does not exist in $OUTPUT_REPO — create it first, publishing does not open new branches"
     fi
-    # A read-only token passes ls-remote and fails the push: reading talks to
-    # upload-pack, writing to receive-pack, and the host refuses that one
-    # separately. The probe asks receive-pack for a deletion of a branch name
-    # that does not exist, as a dry run — the host answers the permission
-    # question at the connection, before any ref is looked at, and there is
-    # nothing here that could change the repository even without --dry-run.
+    # A read-only token passes ls-remote and fails the push, so reading proves
+    # nothing about writing.
     if [ "$VERIFY_PUSH" = "1" ] && [ "$OUTPUT_REPO_PUSH" = "1" ]; then
-        probe_dir="$(mktemp -d)"; probe_out="$(mktemp)"
-        git init --quiet "$probe_dir"
-        GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output -C "$probe_dir" push --dry-run \
-            -- "$OUTPUT_REPO" ":refs/heads/appsec-advisor-write-probe" >"$probe_out" 2>&1 || :
-        probe_text="$(tr -d '\r' <"$probe_out" | tr '\n' ' ')"
-        rm -rf "$probe_dir" "$probe_out"
+        probe_text="$(push_probe "$OUTPUT_REPO" with-token)"
         case "$probe_text" in
             *403*|*"not authorized"*|*"Permission"*|*"permission"*|*"denied"*|*"read-only"*|*"not allowed to push"*)
-                die "the credentials for $OUTPUT_REPO may read it but not write to it — the token needs write access. Nothing has been scanned yet, so nothing is lost by fixing it now" ;;
+                # Same as for reading: the token may be the only thing standing
+                # in the way, because it displaced the key or helper that could
+                # have pushed. Ask git with its own configuration before this
+                # run ends over a credential it was handed.
+                probe_plain=""
+                [ -n "$OUTPUT_GIT_TOKEN" ] && probe_plain="$(push_probe "$OUTPUT_REPO" without-token)"
+                case "$probe_plain" in
+                    *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*)
+                        OUTPUT_GIT_TOKEN=""
+                        warn "the output token may not write to $OUTPUT_REPO, but git's own credentials may — dropping the token for this run"
+                        ok "the credentials may write to $OUTPUT_REPO"
+                        pf_pass "repo access" "readable and writable · without the configured token" ;;
+                    *)  die "the credentials for $OUTPUT_REPO may read it but not write to it. Nothing has been scanned yet, so nothing is lost by fixing it now:
+      · a fine-grained token needs 'Contents: read and write' on that repository — 'Administration' creates repositories and does not push to them
+      · a classic token needs the 'repo' scope
+      · an ssh URL (git@…) pushes with your key and needs no token at all
+      the host said: ${probe_text:-nothing}" ;;
+                esac ;;
             *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*|"")
                 ok "the credentials may write to $OUTPUT_REPO"
                 pf_pass "repo access" "readable and writable" ;;
