@@ -342,8 +342,9 @@ Options:
   --target-repo <url>    Git repository to clone and scan (https://, ssh:// or git@)
   --target-ref  <ref>    Branch, tag or commit for --target-repo
   --output-dir  <dir>    Report directory (default: ./appsec-reports/<target-slug>,
-                         and with --output-repo the cache instead, because the
-                         report is then read from the repository)
+                         and with --output-repo a temporary directory that is
+                         cleared at the start of every run, because the report
+                         is then read from the repository)
   --output-repo <url>    Publish the finished report into this git repository
   --create-output-repo   Create --output-repo on its host when it is not there,
                          without asking. Always private. Needs OUTPUT_GIT_TOKEN
@@ -410,10 +411,12 @@ Plugin and scan:
       credentials for a private --target-repo over https (GitLab PAT, project or
       group token; GitHub: TARGET_GIT_USER=x-access-token). ssh URLs use your key.
   OUTPUT_DIR_BASE=<dir>  parent of the report directory when --output-dir is
-      omitted. Default ./appsec-reports, except when the run publishes: then the
-      scan works in <cache>/reports/<target-slug>, one directory per target so
-      model, changelog and finding ids survive to the next run. Setting this
-      brings the named directory back for a publishing run too
+      omitted. Default ./appsec-reports, reused and overwritten by the next run
+      of the same target. A run that publishes works in
+      $TMPDIR/appsec-advisor/<target-slug> instead, cleared without asking at
+      the start of every such run, so it starts from nothing every time: no
+      earlier model, no changelog, new finding ids. Setting this, or
+      --output-dir, brings a stable directory back
   OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>  OUTPUT_REPO_PATH=reports/<slug>
   OUTPUT_REPO_CREATE=1   (same as --create-output-repo) create it when missing,
       always private   OUTPUT_REPO_HOST=auto|github|gitlab  which API to use;
@@ -1383,23 +1386,38 @@ fi
 # ══════════════════════ 4. Prepare the output directory ══════════════════════
 step "Prepare output directory"
 
+# Three cases, and the named path always wins:
+#   --output-dir            that directory
+#   --output-repo, no path  a fresh temporary directory per run
+#   neither                 $OUTPUT_DIR_BASE/<slug>, reused and overwritten
+#
 # A run that publishes reads its report from the output repository, not from
 # here: the local directory is where the scan works and where the publish step
 # copies from. Leaving that in whatever directory the run was started from puts
 # a few hundred intermediates into someone's working repository for no one's
-# benefit, so a publishing run works next to the caches instead — unless a path
-# was named, in which case the named path wins, as always.
+# benefit.
 #
-# Still one directory per target and not a fresh one per run: that directory
-# carries the model, the changelog and the finding IDs from one assessment of a
-# target to the next. A new directory every time would publish a first report
-# every time — new IDs, no changelog, nothing to compare against — and would
-# leave the reports of failed runs scattered under names nobody knows.
+# One directory per target under the temp space, cleared at the start of every
+# publishing run: a per-run name would leave the intermediates of every run ever
+# started lying around, and asking whether the last one may go would be a
+# question about a directory the user never chose. What is cleared was published
+# — the report itself lives in the repository. That also means such a run starts
+# from nothing every time: no earlier model, no changelog against the last
+# assessment, new finding ids. Where that continuity matters, name a stable
+# directory with --output-dir or OUTPUT_DIR_BASE, and nothing is cleared.
 OUTPUT_DIR_STAGING=0
 if [ -z "$OUTPUT_DIR" ]; then
     if [ -n "$OUTPUT_REPO" ] && [ "$OUTPUT_DIR_BASE_SET" = "0" ]; then
-        OUTPUT_DIR="$CACHE_DIR/reports/$SLUG"
+        STAGING_BASE="${TMPDIR:-/tmp}/appsec-advisor"
+        OUTPUT_DIR="$STAGING_BASE/$SLUG"
         OUTPUT_DIR_STAGING=1
+        # rm -rf on a computed path answers to the path, not to the intent that
+        # built it: clear only what is one level under the staging base, and
+        # never something a changed default or an empty slug produced.
+        case "$OUTPUT_DIR" in
+            "$STAGING_BASE"/?*) rm -rf "$OUTPUT_DIR" ;;
+            *) die "refusing to clear a staging directory that is not under $STAGING_BASE: $OUTPUT_DIR" ;;
+        esac
     else
         OUTPUT_DIR="$OUTPUT_DIR_BASE/$SLUG"
     fi
@@ -1439,13 +1457,19 @@ if [ "$SCAN_MODE" = "rerender" ]; then
     # A rerender re-renders the assessment of an earlier run in this very
     # directory; without its artifacts there is nothing to render.
     rerender_missing="$(rerender_inputs_missing "$OUTPUT_DIR")"
-    [ -z "$rerender_missing" ] \
-        || die "--mode rerender needs the assessment of an earlier run in $OUTPUT_DIR — missing: $rerender_missing; run --mode standard first"
+    if [ -n "$rerender_missing" ]; then
+        # A publishing run is always in a directory it just made, so the render
+        # it is asked for lives somewhere the run cannot guess.
+        rerender_hint="run --mode standard first"
+        [ "$OUTPUT_DIR_STAGING" = "1" ] \
+            && rerender_hint="a publishing run clears its temporary directory first — point --output-dir at the earlier run's, or run --mode standard first"
+        die "--mode rerender needs the assessment of an earlier run in $OUTPUT_DIR — missing: $rerender_missing; $rerender_hint"
+    fi
 fi
 
 ok "$OUTPUT_DIR"
 if [ "$OUTPUT_DIR_STAGING" = "1" ]; then
-    detail "this run publishes, so the scan works outside the current directory — --output-dir or OUTPUT_DIR_BASE overrides that"
+    detail "this run publishes, so the scan works in a temporary directory that every publishing run clears first — --output-dir or OUTPUT_DIR_BASE keeps it in a stable one"
 fi
 pf_pass target "$TARGET"
 pf_pass "output dir" "$OUTPUT_DIR · writable"
