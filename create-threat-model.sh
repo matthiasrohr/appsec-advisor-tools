@@ -1000,6 +1000,16 @@ print(str(data[field]))
     fi
 }
 
+# Whether a directory takes a file, answered by writing one. `[ -w ]` answers
+# from the permission bits, and an ACL, a read-only mount, a full filesystem and
+# a container that runs under another uid all pass that and fail the first real
+# write — which happens after the clone, or after the scan.
+probe_writable() {  # probe_writable <dir> <what it is>
+    local probe="$1/.appsec-write-probe.$$"
+    : >"$probe" 2>/dev/null || die "$2 is not writable: $1"
+    rm -f "$probe"
+}
+
 # ═════════════════════════════ 1. Preflight ══════════════════════════════════
 step "Preflight"
 
@@ -1023,6 +1033,27 @@ else
     ok "claude $("$CLAUDE_EXECUTABLE" --version 2>/dev/null | head -1)"
     pf_pass claude "$("$CLAUDE_EXECUTABLE" --version 2>/dev/null | head -1)"
     pf_pass packages "pyyaml · jsonschema"
+
+    # An export this machine cannot produce is worth knowing before the scan
+    # rather than after it: the plugin's exporters stop at the missing binary,
+    # and by then the report is written and paid for. The Markdown report does
+    # not depend on either, so this is no reason to refuse the run.
+    if [ "$WITH_PDF" = "1" ] || [ "$WITH_HTML" = "1" ]; then
+        export_want=""; export_missing=""
+        [ "$WITH_PDF" = "1" ]  && export_want="pdf"
+        [ "$WITH_HTML" = "1" ] && export_want="${export_want:+$export_want · }html"
+        command -v pandoc >/dev/null 2>&1 || export_missing="pandoc"
+        if [ "$WITH_PDF" = "1" ] && ! command -v weasyprint >/dev/null 2>&1; then
+            export_missing="${export_missing:+$export_missing }weasyprint"
+        fi
+        if [ -n "$export_missing" ]; then
+            warn "$export_want was asked for, but this machine has no $export_missing — the run writes the Markdown report and skips that export"
+            pf_warn exports "$export_want · missing: $export_missing"
+        else
+            ok "export tooling for $export_want present"
+            pf_pass exports "$export_want · tooling present"
+        fi
+    fi
 
     resolve_auth
     if [ -n "$MAX_BUDGET" ] && [ "${KEY_SOURCE_EFFECTIVE:-none}" = "none" ]; then
@@ -1080,6 +1111,10 @@ PY
 esac
 
 mkdir -p "$CACHE_DIR" || die "cannot create cache directory: $CACHE_DIR"
+# The plugin clone, the target clone and, for a publishing run, the report all
+# live here. An existing directory that no longer takes a file otherwise shows
+# up as a git error in the middle of a fetch.
+probe_writable "$CACHE_DIR" "the cache directory"
 
 # ══════════════════════ 2. Provision the plugin ══════════════════════════════
 step "Provision appsec-advisor ($ADVISOR_SOURCE)"
@@ -1270,6 +1305,10 @@ if [ -n "$TARGET_REPO" ]; then
         fi
     fi
     ok "target checked out at $(git -C "$TARGET" rev-parse --short HEAD)"
+    # Which credential got the clone out is worth a line of its own: a token
+    # that reads the target is the one thing about it that was proven here, and
+    # a run that failed to publish later should not leave that open too.
+    pf_pass "target repo" "$TARGET_REPO${TARGET_REF:+ @ $TARGET_REF} · cloned at $(git -C "$TARGET" rev-parse --short HEAD)${TARGET_GIT_TOKEN:+ · TARGET_GIT_TOKEN accepted}"
 else
     [ -e "$TARGET_DIR" ] || die "--target-dir does not exist: $TARGET_DIR"
     [ -d "$TARGET_DIR" ] || die "--target-dir is not a directory: $TARGET_DIR"
@@ -1328,6 +1367,10 @@ if [ -z "$OUTPUT_DIR" ]; then
 fi
 mkdir -p "$OUTPUT_DIR" || die "cannot create output directory: $OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+# Creating it proves the parent takes directories, nothing about this one: an
+# output directory from an earlier run under another user, or on a mount that
+# has since gone read-only, fails on the first artifact — an hour in.
+probe_writable "$OUTPUT_DIR" "the output directory"
 LOG_FILE="$OUTPUT_DIR/run.log"
 [ "$SAVE_CONSOLE_LOG" = "1" ] && CONSOLE_LOG="$OUTPUT_DIR/console.log"
 
@@ -1366,7 +1409,7 @@ if [ "$OUTPUT_DIR_STAGING" = "1" ]; then
     detail "this run publishes, so the scan works outside the current directory — --output-dir or OUTPUT_DIR_BASE overrides that"
 fi
 pf_pass target "$TARGET"
-pf_pass "output dir" "$OUTPUT_DIR"
+pf_pass "output dir" "$OUTPUT_DIR · writable"
 detail "log: $LOG_FILE"
 
 # GNU and BSD stat agree on nothing but the file they are asked about.
@@ -1525,6 +1568,13 @@ if [ -n "$OUTPUT_REPO" ]; then
                 # reason to stop a scan. The push has its own diagnostics.
                 warn "could not tell whether the credentials may write to $OUTPUT_REPO — the push will decide: $probe_text" ;;
         esac
+    elif [ "$OUTPUT_REPO_PUSH" = "1" ]; then
+        # Reading it was proven above, writing was not, and this run will push.
+        # A row that names which of the two was tested beats a block that leaves
+        # the reader to work out which check the configuration switched off.
+        pf_warn "repo access" "readable · write access not probed (VERIFY_PUSH=0)"
+    else
+        pf_pass "repo access" "readable · the run commits without pushing (OUTPUT_REPO_PUSH=0)"
     fi
     ok "report will be published to $OUTPUT_REPO in $OUTPUT_REPO_PATH/"
     pf_pass "publish to" "$OUTPUT_REPO · $OUTPUT_REPO_PATH/"
