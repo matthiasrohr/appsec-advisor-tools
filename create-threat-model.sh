@@ -452,7 +452,9 @@ Plugin and scan:
   OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>
   OUTPUT_REPO_PATH=reports/<owner>/<name>   where the report lands in that
       repository; the default carries the target's owner, so two repositories of
-      the same name in different organizations do not overwrite each other
+      the same name in different organizations do not overwrite each other, and
+      drops the owner where it is the repository name again (juice-shop/
+      juice-shop lands in reports/juice-shop)
   TARGET_REPO=<url>  TARGET_DIR=<path>  TARGET_REF=<ref>  OUTPUT_DIR=<dir>
       the same as --target-repo, --target-dir, --target-ref and --output-dir,
       for a caller that has variables rather than a command line
@@ -725,6 +727,14 @@ if [ -z "$OUTPUT_REPO_PATH" ]; then
         case "$repo_path" in
             */*) owner_path="$(printf '%s' "${repo_path%/*}" \
                     | tr -c 'A-Za-z0-9._/-' '-' | sed 's#/\{2,\}#/#g; s#^[/-]*##; s#[/-]*$##; s#\.\.#-#g')" ;;
+        esac
+        # Where the owner ends in the repository name — github.com/juice-shop/
+        # juice-shop, gitlab.com/acme/tools/tools — the second copy names
+        # nothing the first one does not, and reports/juice-shop/juice-shop
+        # reads like a mistake to everyone who opens the report repository.
+        case "$owner_path" in
+            "$SLUG"|*/"$SLUG")
+                owner_path="${owner_path%"$SLUG"}"; owner_path="${owner_path%/}" ;;
         esac
         [ -n "$owner_path" ] && OUTPUT_REPO_PATH="reports/$owner_path/$SLUG"
     fi

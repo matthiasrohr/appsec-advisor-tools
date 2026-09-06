@@ -112,7 +112,7 @@ Where both live in the same place, one credential does: `GIT_TOKEN`, `GIT_TOKEN_
 
 ### Publishing
 
-`--output-repo <url>` copies the finished artifacts into a clone of that repository and commits them under `reports/<owner>/<name>`, taken from the target URL so that two repositories of the same name in different organizations do not overwrite each other; `OUTPUT_REPO_PATH` can change it. The scan itself always runs into the local output directory, so transient run files stay out of the published report. `OUTPUT_REPO_PUSH=0` commits without pushing.
+`--output-repo <url>` copies the finished artifacts into a clone of that repository and commits them under `reports/<owner>/<name>`, taken from the target URL so that two repositories of the same name in different organizations do not overwrite each other. Where the owner is the repository name again, it is not repeated: `github.com/juice-shop/juice-shop` lands in `reports/juice-shop`. `OUTPUT_REPO_PATH` can change it. The scan itself always runs into the local output directory, so transient run files stay out of the published report. `OUTPUT_REPO_PUSH=0` commits without pushing.
 
 ## Trust mode
 
