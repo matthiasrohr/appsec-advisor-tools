@@ -28,6 +28,18 @@ fi
 
 set -Eeuo pipefail
 
+# Bash reads a script from disk while it runs it, by byte offset — it does not
+# hold the file. Rewrite the file mid-run and the next read lands wherever that
+# offset now points, mid-line, in text that never belonged there: on 2026-09-06
+# a run that had already finished its scan died in `step "Run threat model"`, a
+# line it had executed an hour earlier, and then ran a line of the help text as
+# a command. It lost its report on the way, because publishing comes after the
+# scan. One group around the body settles it: bash parses the whole file before
+# the first command of it runs, so the launcher can be edited while it works.
+# The body deliberately keeps its indentation — the group is a parsing device,
+# not a block anyone reads. The closing `}` is the last line of the file.
+{
+
 # Where this script lives, so an optional companion next to it is found without
 # configuration, wherever the pair was copied to.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -1722,3 +1734,5 @@ if [ -n "$OUTPUT_REPO" ]; then
 fi
 
 exit "$RC"
+
+}
