@@ -175,11 +175,22 @@ CLONE_DEPTH="${CLONE_DEPTH:-1}"                   # 0 → full history (needed f
 # Credentials for a private --target-repo over https. Without these, git uses
 # whatever it already has: a credential helper, or a key for an ssh URL. The
 # token reaches git through a credential helper, so it appears neither in the
-# process list nor in the clone's .git/config. It is NOT the same token as
-# OUTPUT_GIT_TOKEN below, which writes the report repository.
-TARGET_GIT_TOKEN="${TARGET_GIT_TOKEN:-}"
-TARGET_GIT_TOKEN_FILE="${TARGET_GIT_TOKEN_FILE:-}"   # file holding it, chmod 600
-TARGET_GIT_USER="${TARGET_GIT_USER:-oauth2}"         # GitLab: oauth2, GitHub: x-access-token
+# process list nor in the clone's .git/config. It does not have to be the same
+# token as OUTPUT_GIT_TOKEN below, which writes the report repository.
+#
+# One credential for both, for the case where the target and the report live in
+# the same place: GIT_TOKEN (or GIT_TOKEN_FILE, and GIT_USER for the account
+# name) is what the two pairs fall back to. The specific variable wins wherever
+# it is set, so the split stays available where reading and writing should not
+# hang on one secret. Two hosts and one token is the case worth thinking about,
+# and the preflight says so.
+GIT_TOKEN="${GIT_TOKEN:-}"
+GIT_TOKEN_FILE="${GIT_TOKEN_FILE:-}"
+GIT_USER="${GIT_USER:-}"
+
+TARGET_GIT_TOKEN="${TARGET_GIT_TOKEN:-$GIT_TOKEN}"
+TARGET_GIT_TOKEN_FILE="${TARGET_GIT_TOKEN_FILE:-$GIT_TOKEN_FILE}"   # file holding it, chmod 600
+TARGET_GIT_USER="${TARGET_GIT_USER:-${GIT_USER:-oauth2}}"           # GitLab: oauth2, GitHub: x-access-token
 
 # ── Publishing the report to a git repository ────────────────────────────────
 # Also settable per run with --output-repo. The scan itself always runs into the
@@ -201,11 +212,12 @@ OUTPUT_REPO_CREATE="${OUTPUT_REPO_CREATE:-0}"        # 1 → same as --create-ou
 OUTPUT_REPO_HOST="${OUTPUT_REPO_HOST:-auto}"         # auto | github | gitlab
 OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat-model.figure*.svg threat-model.sarif.json threat-model.threatdragon.json threat-model.pdf threat-model.html pentest-tasks.yaml console.log}"
 
-# Write credentials for OUTPUT_REPO. Deliberately separate from the target ones:
-# reading a repository and writing to one are different privileges.
-OUTPUT_GIT_TOKEN="${OUTPUT_GIT_TOKEN:-}"
-OUTPUT_GIT_TOKEN_FILE="${OUTPUT_GIT_TOKEN_FILE:-}"   # file holding it, chmod 600
-OUTPUT_GIT_USER="${OUTPUT_GIT_USER:-oauth2}"
+# Write credentials for OUTPUT_REPO. Separate from the target ones by default,
+# because reading a repository and writing to one are different privileges —
+# and falling back to GIT_TOKEN where one credential covers both.
+OUTPUT_GIT_TOKEN="${OUTPUT_GIT_TOKEN:-$GIT_TOKEN}"
+OUTPUT_GIT_TOKEN_FILE="${OUTPUT_GIT_TOKEN_FILE:-$GIT_TOKEN_FILE}"   # file holding it, chmod 600
+OUTPUT_GIT_USER="${OUTPUT_GIT_USER:-${GIT_USER:-oauth2}}"
 OUTPUT_GIT_NAME="${OUTPUT_GIT_NAME:-appsec-advisor}"
 OUTPUT_GIT_EMAIL="${OUTPUT_GIT_EMAIL:-appsec-advisor@localhost}"
 # Parent directory for the report when --output-dir is omitted. OUTPUT_BASE is
@@ -391,6 +403,9 @@ the CONFIGURATION block at the top of the script.
 Plugin and scan:
   ADVISOR_SOURCE=official|local   ADVISOR_REF=latest|main|dev|<tag>|<sha>
   ADVISOR_LOCAL_PATH=<checkout|build-dir|.tgz>
+  GIT_TOKEN=…   GIT_TOKEN_FILE=<chmod 600>   GIT_USER=oauth2
+      one credential for the target and the report repository, for when both
+      live in the same place. TARGET_* and OUTPUT_* below win where they are set
   TARGET_GIT_TOKEN=…   TARGET_GIT_TOKEN_FILE=<chmod 600>   TARGET_GIT_USER=oauth2
       credentials for a private --target-repo over https (GitLab PAT, project or
       group token; GitHub: TARGET_GIT_USER=x-access-token). ssh URLs use your key.
@@ -553,6 +568,30 @@ if [ -z "$OUTPUT_GIT_TOKEN" ] && [ -n "$OUTPUT_GIT_TOKEN_FILE" ]; then
     OUTPUT_GIT_TOKEN="$(cat -- "$OUTPUT_GIT_TOKEN_FILE")"
 fi
 OUTPUT_GIT_TOKEN="$(printf '%s' "$OUTPUT_GIT_TOKEN" | tr -d '[:space:]')"
+
+# The host out of a git URL, in both spellings git accepts.
+git_host() {  # git_host <url>
+    local u="$1" h=""
+    case "$u" in
+        *://*) h="${u#*://}"; h="${h#*@}"; h="${h%%/*}" ;;
+        *@*:*) h="${u#*@}";   h="${h%%:*}" ;;
+    esac
+    printf '%s' "${h%%:*}"
+}
+
+# One credential for two hosts is what GIT_TOKEN makes easy to reach by accident,
+# and setting both variables to the same value reaches it deliberately: the
+# credential helper answers whatever git asks it about, so the secret is offered
+# to the target host and to the report host alike. Same host — the case the
+# fallback exists for — is no finding, and says nothing here.
+if [ -n "$TARGET_GIT_TOKEN" ] && [ "$TARGET_GIT_TOKEN" = "$OUTPUT_GIT_TOKEN" ] \
+        && [ -n "$TARGET_REPO" ] && [ -n "$OUTPUT_REPO" ]; then
+    t_host="$(git_host "$TARGET_REPO")"; o_host="$(git_host "$OUTPUT_REPO")"
+    if [ -n "$t_host" ] && [ -n "$o_host" ] && [ "$t_host" != "$o_host" ]; then
+        warn "one git credential for two hosts: it is offered to $t_host and to $o_host — set TARGET_GIT_TOKEN and OUTPUT_GIT_TOKEN to keep them apart"
+        pf_warn "git token" "one credential for $t_host and $o_host"
+    fi
+fi
 
 if [ -n "$OUTPUT_REPO" ]; then
     case "$OUTPUT_REPO_PUSH" in 0|1) ;; *) die "OUTPUT_REPO_PUSH must be 0 or 1 (got: $OUTPUT_REPO_PUSH)" ;; esac

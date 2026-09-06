@@ -98,6 +98,10 @@ KEY_SOURCE=aws AWS_SECRET_ID=appsec-advisor/anthropic-api-key \
 
 Reading a private target repository and writing a report repository take separate credentials, because they are separate privileges: `TARGET_GIT_TOKEN` or `TARGET_GIT_TOKEN_FILE` for `--target-repo`, `OUTPUT_GIT_TOKEN` or `OUTPUT_GIT_TOKEN_FILE` for `--output-repo`. Tokens reach git through a credential helper, so they show up neither in the process list nor in the clone's `.git/config`.
 
+Where both repositories live in the same place, one credential does: `GIT_TOKEN` (or `GIT_TOKEN_FILE`, and `GIT_USER` for the account name) is what both pairs fall back to, and the specific variable still wins wherever it is set. One credential for two hosts is the case to think about — the helper answers whatever git asks it about, so the same secret is offered to both — and a run that does that says so in its preflight.
+
+Creating the report repository with `--create-output-repo` is the one thing a git credential cannot do: the repository is made through the host's API, so it needs `OUTPUT_GIT_TOKEN` (or `GIT_TOKEN`) with `repo` on GitHub or `api` on GitLab, which is more than pushing needs. Publishing into a repository that already exists needs no token at all when the URL is an ssh one — that push travels on your key.
+
 ### Publishing
 
 `--output-repo <url>` copies the finished artifacts into a clone of that repository and commits them under `reports/<target-slug>`, which `OUTPUT_REPO_PATH` can change. The scan itself always runs into the local output directory, so transient run files stay out of the published report. `OUTPUT_REPO_PUSH=0` commits without pushing.
