@@ -1767,11 +1767,18 @@ if [ -n "$OUTPUT_REPO" ]; then
                         warn "the output token may not write to $OUTPUT_REPO, but git's own credentials may — dropping the token for this run"
                         ok "the credentials may write to $OUTPUT_REPO"
                         pf_pass "repo access" "readable and writable · without the configured token" ;;
-                    *)  die "the credentials for $OUTPUT_REPO may read it but not write to it. Nothing has been scanned yet, so nothing is lost by fixing it now:
+                    *)  # A probe is evidence, not a verdict: it asks about a
+                        # deletion, the run performs a push, and a host may
+                        # answer the two differently — an empty repository in
+                        # particular. So it warns and the push decides, which is
+                        # also the only reading under which a credential this
+                        # run cannot judge does not cost the run.
+                        warn "the credentials for $OUTPUT_REPO may read it but not write to it, as far as this probe can tell — the run continues and the push at the end decides:
       · a fine-grained token needs 'Contents: read and write' on that repository — 'Administration' creates repositories and does not push to them
       · a classic token needs the 'repo' scope
       · an ssh URL (git@…) pushes with your key and needs no token at all
-      the host said: ${probe_text:-nothing}" ;;
+      the host said: ${probe_text:-nothing}"
+                        pf_warn "repo access" "readable · the write probe was refused, the push will decide" ;;
                 esac ;;
             *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*|"")
                 ok "the credentials may write to $OUTPUT_REPO"
@@ -1950,6 +1957,13 @@ fi
 if [ -n "$OUTPUT_REPO" ]; then
     step "Publish report to $OUTPUT_REPO"
 
+    # Where a failed publish leaves the report. In a temporary staging directory
+    # that is true only until the next publishing run of this target clears it,
+    # and a report that cost an hour deserves to say so before then.
+    KEEP_NOTE="the report is complete in $OUTPUT_DIR"
+    [ "${OUTPUT_DIR_STAGING:-0}" = "1" ] \
+        && KEEP_NOTE="$KEEP_NOTE — a temporary directory the next publishing run of this target clears, so move it if you need it"
+
     PUB_DIR="$CACHE_DIR/publish/$SLUG"
     rm -rf "$PUB_DIR"; mkdir -p "$(dirname "$PUB_DIR")"
     pub_clone=(clone --quiet --depth 1)
@@ -2041,19 +2055,19 @@ if [ -n "$OUTPUT_REPO" ]; then
                             # commit on top of theirs, once.
                             info "the branch moved on the remote — rebasing and pushing again"
                             git_output -C "$PUB_DIR" pull --rebase --quiet origin HEAD \
-                                || { rm -f "$push_err"; die "rebasing onto the moved branch failed — resolve it in $PUB_DIR"; }
+                                || { rm -f "$push_err"; die "rebasing onto the moved branch failed — resolve it in $PUB_DIR; $KEEP_NOTE"; }
                             git_output -C "$PUB_DIR" push --quiet origin HEAD \
-                                || { rm -f "$push_err"; die "pushing after the rebase failed — the report is complete in $OUTPUT_DIR"; } ;;
+                                || { rm -f "$push_err"; die "pushing after the rebase failed — $KEEP_NOTE"; } ;;
                         *"protected branch"*|*"pre-receive hook declined"*)
                             rm -f "$push_err"
-                            die "the remote refused the push (protected branch or a hook) — publish to a branch that accepts writes via OUTPUT_REPO_BRANCH; the report is complete in $OUTPUT_DIR" ;;
+                            die "the remote refused the push (protected branch or a hook) — publish to a branch that accepts writes via OUTPUT_REPO_BRANCH; $KEEP_NOTE" ;;
                         *403*|*"not authorized"*|*"Permission"*|*"denied"*|*"read-only"*)
                             rm -f "$push_err"
-                            die "the credentials may read $OUTPUT_REPO but not write to it — the token needs write access; the report is complete in $OUTPUT_DIR" ;;
+                            die "the credentials may read $OUTPUT_REPO but not write to it — a fine-grained token needs 'Contents: read and write' there ('Administration' creates repositories and does not push to them), a classic one the 'repo' scope, and an ssh URL neither; $KEEP_NOTE" ;;
                         *)
                             printf '%s\n' "$push_text" | sed 's/^/      /' >&2
                             rm -f "$push_err"
-                            die "pushing to $OUTPUT_REPO failed — the report is complete in $OUTPUT_DIR" ;;
+                            die "pushing to $OUTPUT_REPO failed — $KEEP_NOTE" ;;
                     esac
                 fi
                 rm -f "$push_err"
