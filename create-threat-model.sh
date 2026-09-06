@@ -1588,6 +1588,23 @@ if [ -f "$OUTPUT_DIR/threat-model.yaml" ] && [ -f "$PLUGIN_DIR/scripts/run_summa
 fi
 
 # ══════════════════════ 8. Publish the report ════════════════════════════════
+# A run that failed does not own what lies in its output directory. The files
+# there can be an earlier assessment, or — as on 2026-09-05, when a run died on
+# LOCK_BLOCKED — the half-written model of another run still working in the same
+# directory. Nothing in a file says which run wrote it, so the exit code is the
+# only evidence there is, and it has to decide before the first file is staged.
+# Exit 20 is not a failed run: it is the --fail-on gate reporting new threats in
+# a report that was written and finished, which is a report worth publishing.
+if [ -n "$OUTPUT_REPO" ] && [ "$RC" -ne 0 ] && [ "$RC" -ne 20 ]; then
+    step "Publish report to $OUTPUT_REPO"
+    warn "the scan failed (exit $RC), so nothing is published — $OUTPUT_REPO is unchanged"
+    detail "artifacts left in the output directory can be from an earlier or a"
+    detail "concurrent run; this run cannot vouch for them"
+    detail "report directory: $OUTPUT_DIR"
+    detail "log: $LOG_FILE"
+    exit "$RC"
+fi
+
 if [ -n "$OUTPUT_REPO" ]; then
     step "Publish report to $OUTPUT_REPO"
 
@@ -1656,14 +1673,10 @@ if [ -n "$OUTPUT_REPO" ]; then
     fi
 
     if [ "$published" -eq 0 ]; then
-        # Say which of the two it is. An empty output repository is fine and
-        # says nothing about this; what decides is whether the run produced a
-        # report at all.
-        if [ "$RC" -ne 0 ]; then
-            warn "the scan failed (exit $RC), so no report exists to publish — $OUTPUT_REPO is unchanged"
-        else
-            warn "the run wrote none of $OUTPUT_REPO_FILES, so there is nothing to publish — $OUTPUT_REPO is unchanged"
-        fi
+        # An empty output repository is fine and says nothing about this. A
+        # failed scan no longer arrives here at all, so the run that finds
+        # nothing to publish is one that finished and wrote none of the files.
+        warn "the run wrote none of $OUTPUT_REPO_FILES, so there is nothing to publish — $OUTPUT_REPO is unchanged"
     else
         git -C "$PUB_DIR" add -- "$OUTPUT_REPO_PATH" || die "git add failed in the output clone"
         if git -C "$PUB_DIR" diff --cached --quiet; then
