@@ -31,17 +31,21 @@ The report lands in `./appsec-reports/<target-slug>/` unless `--output-dir` says
 
 ```bash
 ADVISOR_REPO_URL=https://github.com/appsec-foundry/appsec-advisor \
-ASSESSMENT_DEPTH=quick \
 ADVISOR_REF=dev \
+ASSESSMENT_DEPTH=quick \
+WITH_REQUIREMENTS=1 \
 ./create-threat-model.sh --target-repo https://github.com/juice-shop/juice-shop \
-    --output-repo https://github.com/example/appsec-reports \
-    --console-log --create-output-repo --max-budget 30
+    --url http://localhost:3000 \
+    --output-repo https://github.com/example/juice-shop-report \
+    --create-output-repo --console-log --max-budget 30
 ```
 
 - `ADVISOR_REPO_URL` — where the plugin is cloned from; the value above is the default, set it for a fork or a mirror.
-- `ASSESSMENT_DEPTH=quick` — shallowest of `quick`, `standard` (default), `thorough`.
 - `ADVISOR_REF=dev` — plugin ref to run: branch, tag or commit. Default `latest` = newest release tag.
+- `ASSESSMENT_DEPTH=quick` — shallowest of `quick`, `standard` (default), `thorough`.
+- `WITH_REQUIREMENTS=1` — grade the findings against the requirements catalog the plugin is configured with; there is no launcher flag for it, the variable is what passes `--requirements` to the run.
 - `--target-repo <url>` — clone and scan that repository, here at its default branch.
+- `--url http://localhost:3000` — where that repository is running. The scan stays static; the URL only ends up in `pentest-tasks.yaml`, as the target of the Strix tasks.
 - `--output-repo <url>` — publish the artifacts there, under `reports/<target-slug>`.
 - `--create-output-repo` — create it, private, when it is missing. Needs `OUTPUT_GIT_TOKEN` with creation rights.
 - `--console-log` — keep the script's own output as `console.log` and publish it too.
