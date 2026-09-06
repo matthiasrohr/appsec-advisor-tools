@@ -1469,6 +1469,13 @@ if [ -n "$OUTPUT_REPO" ]; then
     ok "report will be published to $OUTPUT_REPO in $OUTPUT_REPO_PATH/"
     pf_pass "publish to" "$OUTPUT_REPO · $OUTPUT_REPO_PATH/"
     [ "${REMOTE_EMPTY:-0}" = "1" ] && detail "the repository is still empty — this run publishes the first report into it"
+else
+    # A run that publishes nothing is a normal run, so this is no warning. It is
+    # in the block because the absence is what nobody sees: a command line that
+    # lost its --output-repo — one missing backslash at the end of a line is
+    # enough — looks exactly like a run that never had one, and the difference
+    # only shows an hour later, when the scan is done and nothing is published.
+    pf_pass "publish to" "no --output-repo · the report stays in the output directory"
 fi
 
 # ══════════════════════ 5. Profile the target ════════════════════════════════
