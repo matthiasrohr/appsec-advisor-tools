@@ -1059,11 +1059,22 @@ check_remote_repo() {  # check_remote_repo <url> <description> [none|target|outp
             # private repository the credentials may not see, so "not found"
             # here is about the credentials, and saying "does not exist" would
             # send someone looking for the wrong thing.
-            [ "${REMOTE_CONFIRMED:-0}" = "1" ] && die "the host's API confirms $url exists — git cannot see it with these credentials:
-      · the account name in use is '${OUTPUT_GIT_USER:-}' — GitHub wants x-access-token here, GitLab oauth2
-      · a fine-grained token limited to selected repositories does not cover one created after it was issued; give it access to the new repository, or use a token with the 'repo' scope
-      · an ssh URL (git@…) avoids the question — that push travels on your key
-      The repository is there either way; the next run does not need --create-output-repo"
+            # The host's API answered for this repository, so it is there. What
+            # git cannot do with the credentials at hand is a matter for the
+            # publish step at the end, which tries and reports what it gets —
+            # not a reason to end a run before it has scanned anything. A
+            # repository nobody confirmed is a different case and still stops.
+            [ "${REMOTE_CONFIRMED:-0}" = "1" ] && {
+                warn "the host's API confirms $url exists — git cannot see it with these credentials:
+      · git reads and writes through 'Contents', not 'Administration': a fine-grained token that may create a repository cannot clone it without 'Contents: read and write'
+      · a fine-grained token limited to selected repositories does not cover one created after it was issued — a repository created by this run is never in that list
+      · a classic token needs the 'repo' scope, and the account name in use is '${OUTPUT_GIT_USER:-}' — GitHub wants x-access-token here, GitLab oauth2
+      · an ssh URL (git@…) avoids all of it — that push travels on your key
+      The run continues; publishing at the end will try and say what the host answers.
+      The next run does not need --create-output-repo"
+                pf_warn "repo access" "the host confirms it exists · git cannot read it with these credentials"
+                return 0
+            }
             die "$what does not exist, or the credentials in use cannot see it: $url" ;;
         *"could not read Username"*|*"terminal prompts disabled"*)
             # A private and a missing repository look identical over https: the
@@ -1975,7 +1986,7 @@ if [ -n "$OUTPUT_REPO" ]; then
     if ! git_output "${pub_clone[@]}" -- "$OUTPUT_REPO" "$PUB_DIR" 2>"$pub_err"; then
         sed 's/^/      /' <"$pub_err" >&2
         rm -f "$pub_err"
-        die "cannot clone the output repository: $OUTPUT_REPO"
+        die "cannot clone the output repository: $OUTPUT_REPO — $KEEP_NOTE"
     fi
     if grep -q "cloned an empty repository" "$pub_err" 2>/dev/null; then
         # Step 4 already said so when it checked the remote; saying it twice
