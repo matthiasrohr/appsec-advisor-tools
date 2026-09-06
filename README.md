@@ -49,7 +49,7 @@ WITH_REQUIREMENTS=1 \
 - `--target-repo <url>` — clone and scan that repository, here at its default branch.
 - `--url http://localhost:3000` — where the target runs. The scan stays static; the URL only ends up in `pentest-tasks.yaml`.
 - `--output-repo <url>` — publish the artifacts there, under `reports/<target-slug>`.
-- `--create-output-repo` — create it, private, when it is missing. Needs `OUTPUT_GIT_TOKEN` with creation rights.
+- `--create-output-repo` — create it, private, when it is missing, once the report is finished; a run that fails leaves no repository behind. Needs `OUTPUT_GIT_TOKEN` with creation rights.
 - `--console-log` — keep the script's own output as `console.log` and publish it too.
 - `--soft-budget 30` — steer the run to $30: one that cannot fit does not start, one that overruns still finishes. `--hard-budget` is the cut that kills the session, API billing only, and the runner derives it at 1.25 × the soft budget.
 
@@ -100,7 +100,7 @@ Reading a private target repository and writing a report repository take separat
 
 Where both live in the same place, one credential does: `GIT_TOKEN`, `GIT_TOKEN_FILE` and `GIT_USER` are what both pairs fall back to, and the specific variables still win. Across two hosts the same secret is offered to both, and the preflight says so.
 
-`--create-output-repo` is the one thing a git credential cannot do: the repository is made through the host's API, so the token needs `repo` on GitHub or `api` on GitLab. Publishing into a repository that exists needs no token at all over an ssh URL.
+`--create-output-repo` is the one thing a git credential cannot do: the repository is made through the host's API, so the token needs `repo` on GitHub or `api` on GitLab — and on GitHub a fine-grained token creates through `Administration` but pushes through `Contents`, which are separate permissions. The repository is created when the report is published, not in the preflight. Publishing into a repository that exists needs no token at all over an ssh URL.
 
 ### Publishing
 

@@ -370,7 +370,10 @@ Options:
                          is then read from the repository)
   --output-repo <url>    Publish the finished report into this git repository
   --create-output-repo   Create --output-repo on its host when it is not there,
-                         without asking. Always private. Needs OUTPUT_GIT_TOKEN
+                         without asking, and only once the report is finished —
+                         a run that fails leaves no repository behind. The
+                         preflight checks the token instead, as far as the host
+                         answers that in advance. Always private. Needs OUTPUT_GIT_TOKEN
                          with creation rights (GitHub: repo / GitLab: api),
                          which is more than pushing needs. Without this flag an
                          unreachable output repository is put to you as a
@@ -884,8 +887,81 @@ except Exception: print("")' "$1" 2>/dev/null
 
 # Create the output repository on its host. Only reached with an explicit
 # --create-output-repo, and only when the repository is not there.
+# Host, owner and name out of a repository URL, and which API speaks there.
+# Both the permission check and the creation itself need this, and they must
+# read the same URL the same way.
+REPO_HOST=""; REPO_OWNER=""; REPO_NAME=""; REPO_KIND=""
+parse_repo_url() {  # parse_repo_url <url>
+    local url="$1" host path
+    case "$url" in
+        *://*)  host="${url#*://}"; host="${host#*@}"; path="${host#*/}"; host="${host%%/*}" ;;
+        *@*:*)  host="${url#*@}"; path="${host#*:}"; host="${host%%:*}" ;;
+        *)      die "cannot read a host out of the output repository URL: $url" ;;
+    esac
+    host="${host%%:*}"; path="${path#/}"; path="${path%.git}"; path="${path%/}"
+    REPO_HOST="$host"; REPO_OWNER="${path%/*}"; REPO_NAME="${path##*/}"
+    [ -n "$REPO_NAME" ] && [ -n "$REPO_OWNER" ] && [ "$REPO_OWNER" != "$path" ] \
+        || die "the output repository URL needs an owner and a name to create it: $url"
+    REPO_KIND="$OUTPUT_REPO_HOST"
+    if [ "$REPO_KIND" = "auto" ]; then
+        case "$REPO_HOST" in github.com) REPO_KIND=github ;; *) REPO_KIND=gitlab ;; esac
+    fi
+}
+
+# May this token create a repository there? Asked without creating one, because
+# a run that fails later must not leave a repository behind — the creation
+# itself happens when the report is published. What can be established here is
+# that the token is accepted and, where the host says so, that it carries the
+# rights: GitHub returns a classic token's scopes in a header, and says nothing
+# about a fine-grained one. What cannot be established is reported as that.
+check_create_permission() {  # check_create_permission <url>
+    local url="$1" out code body scopes
+    if [ -z "$OUTPUT_GIT_TOKEN" ]; then
+        warn "creating $url needs OUTPUT_GIT_TOKEN or GIT_TOKEN — a repository is made through the host's API, which no git credential can do"
+        pf_warn "create repo" "no token · the creation at the end will fail"
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || { warn "creating a repository needs curl"; return 0; }
+    HOST_API_HEADER_FILE="$CACHE_DIR/.api-response-headers"
+    parse_repo_url "$url"
+    if [ "$REPO_KIND" = "github" ]; then
+        out="$(host_api GET "https://api.github.com/user" Authorization "Bearer $OUTPUT_GIT_TOKEN")"
+        code="${out##*$'\n'}"
+        case "$code" in
+            200) : ;;
+            *)   warn "the token for $url was not accepted by $REPO_HOST (HTTP $code) — the creation at the end will fail"
+                 pf_warn "create repo" "the token was refused (HTTP $code)"
+                 return 0 ;;
+        esac
+        if scopes="$(api_header x-oauth-scopes)"; then
+            case ",${scopes// /}," in
+                *,repo,*) ok "the token may create repositories in '$REPO_OWNER'"
+                          pf_pass "create repo" "'repo' scope present" ;;
+                *)        warn "this token carries: ${scopes:-no scopes at all} — creating a private repository needs 'repo'; the creation at the end will decide"
+                          pf_warn "create repo" "no 'repo' scope · the creation at the end decides" ;;
+            esac
+        else
+            detail "a fine-grained token: GitHub says nothing about its rights in advance, so the creation at the end decides"
+            pf_pass "create repo" "fine-grained token · needs 'Administration: read and write' on '$REPO_OWNER'"
+        fi
+    else
+        # The namespace has to exist whoever creates it, and asking for it costs
+        # a GET. A token without 'api' is refused right here.
+        out="$(host_api GET "https://$REPO_HOST/api/v4/namespaces/$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$REPO_OWNER")" PRIVATE-TOKEN "$OUTPUT_GIT_TOKEN")"
+        code="${out##*$'\n'}"
+        case "$code" in
+            200)     ok "the token may see the namespace '$REPO_OWNER' on $REPO_HOST"
+                     pf_pass "create repo" "namespace '$REPO_OWNER' reachable with the token" ;;
+            401|403) warn "the token was refused for $REPO_HOST (HTTP $code) — creating needs the 'api' scope; the creation at the end will fail"
+                     pf_warn "create repo" "the token lacks the 'api' scope" ;;
+            *)       warn "the namespace '$REPO_OWNER' does not answer on $REPO_HOST (HTTP $code) — the creation at the end will decide"
+                     pf_warn "create repo" "namespace '$REPO_OWNER' did not answer (HTTP $code)" ;;
+        esac
+    fi
+}
+
 create_output_repo() {  # create_output_repo <url>
-    local url="$1" host path owner name kind token api data out code body msg ns_id hint scopes accepts
+    local url="$1" host owner name kind token api data out code body msg ns_id hint scopes accepts
     command -v curl >/dev/null 2>&1 || die "creating a repository needs curl"
     # One file for the whole exchange; each call overwrites it, so what is read
     # after a refusal are the headers of the call that was refused.
@@ -893,21 +969,9 @@ create_output_repo() {  # create_output_repo <url>
     token="$OUTPUT_GIT_TOKEN"
     [ -n "$token" ] || die "creating $url needs OUTPUT_GIT_TOKEN or OUTPUT_GIT_TOKEN_FILE — a repository is made through the host's API, not through git, and that is a wider permission than pushing"
 
-    case "$url" in
-        *://*)  host="${url#*://}"; host="${host#*@}"; path="${host#*/}"; host="${host%%/*}" ;;
-        *@*:*)  host="${url#*@}"; path="${host#*:}"; host="${host%%:*}" ;;
-        *)      die "cannot read a host out of the output repository URL: $url" ;;
-    esac
-    host="${host%%:*}"; path="${path#/}"; path="${path%.git}"; path="${path%/}"
-    owner="${path%/*}"; name="${path##*/}"
-    [ -n "$name" ] && [ -n "$owner" ] && [ "$owner" != "$path" ] \
-        || die "the output repository URL needs an owner and a name to create it: $url"
-
-    kind="$OUTPUT_REPO_HOST"
-    if [ "$kind" = "auto" ]; then
-        case "$host" in github.com) kind=github ;; *) kind=gitlab ;; esac
-        detail "creating on $host as a $kind host — OUTPUT_REPO_HOST overrides that"
-    fi
+    parse_repo_url "$url"
+    host="$REPO_HOST"; owner="$REPO_OWNER"; name="$REPO_NAME"; kind="$REPO_KIND"
+    [ "$OUTPUT_REPO_HOST" = "auto" ] && detail "creating on $host as a $kind host — OUTPUT_REPO_HOST overrides that"
 
     case "$kind" in
         github)
@@ -1732,13 +1796,15 @@ if [ -n "$OUTPUT_REPO" ]; then
         https://*) [ -n "$OUTPUT_GIT_TOKEN" ] || { warn "no OUTPUT_GIT_TOKEN set — the push will only work if git already has write credentials for $OUTPUT_REPO"
                        pf_warn "repo token" "none set · the push relies on git's own credentials"; } ;;
     esac
-    # Ask first, create second: an existing repository — empty or not — is
-    # never touched, so the flag costs nothing on every run after the first.
+    # Ask first, create last: an existing repository — empty or not — is never
+    # touched, and one that has to be made is made when the report is published,
+    # not here. A scan that dies in the third hour must not leave a repository
+    # behind that nobody asked for and nothing ever fills.
+    OUTPUT_REPO_WILL_CREATE=0
     if GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output ls-remote --quiet -- "$OUTPUT_REPO" HEAD >/dev/null 2>&1; then
         [ "$OUTPUT_REPO_CREATE" = "1" ] && detail "the output repository is there already — nothing to create"
     elif [ "$OUTPUT_REPO_CREATE" = "1" ]; then
-        info "the output repository did not answer — creating it"
-        create_output_repo "$OUTPUT_REPO"
+        OUTPUT_REPO_WILL_CREATE=1
     elif interactive; then
         # Over https a repository that is missing and one that is private look
         # the same, so the question says what is known and not what it guesses.
@@ -1746,69 +1812,79 @@ if [ -n "$OUTPUT_REPO" ]; then
         if ask_choice \
             "the output repository did not answer: $OUTPUT_REPO" \
             "stop here — nothing is scanned, nothing is created" \
-            "c|create" "create it as a private repository and publish into it" \
+            "c|create" "create it as a private repository when the report is published" \
             "creating needs a token that may create repositories, which is more than pushing needs"; then
             :
         else
-            create_output_repo "$OUTPUT_REPO"
+            OUTPUT_REPO_WILL_CREATE=1
         fi
     fi
-    check_remote_repo "$OUTPUT_REPO" "the output repository" output 1
-    if [ -n "$OUTPUT_REPO_BRANCH" ]; then
-        [ "${REMOTE_CREATED:-0}" = "0" ] \
-            || die "a repository this run just created has no branches yet, so OUTPUT_REPO_BRANCH='$OUTPUT_REPO_BRANCH' cannot exist — leave it unset for the first publish, git names the branch on the first push"
-        GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output ls-remote --exit-code --heads -- "$OUTPUT_REPO" "$OUTPUT_REPO_BRANCH" >/dev/null 2>&1 \
-            || die "branch '$OUTPUT_REPO_BRANCH' does not exist in $OUTPUT_REPO — create it first, publishing does not open new branches"
+
+    if [ "$OUTPUT_REPO_WILL_CREATE" = "1" ]; then
+        info "the output repository did not answer — it will be created when the report is published"
+        check_create_permission "$OUTPUT_REPO"
+        [ -n "$OUTPUT_REPO_BRANCH" ] \
+            && die "a repository that does not exist yet has no branches, so OUTPUT_REPO_BRANCH='$OUTPUT_REPO_BRANCH' cannot exist — leave it unset for the first publish, git names the branch on the first push"
+        ok "report will be published to $OUTPUT_REPO in $OUTPUT_REPO_PATH/, into a repository created then"
+        pf_pass "publish to" "$OUTPUT_REPO · $OUTPUT_REPO_PATH/ · created at publish time"
     fi
-    # A read-only token passes ls-remote and fails the push, so reading proves
-    # nothing about writing.
-    if [ "$VERIFY_PUSH" = "1" ] && [ "$OUTPUT_REPO_PUSH" = "1" ]; then
-        probe_text="$(push_probe "$OUTPUT_REPO" with-token)"
-        case "$probe_text" in
-            *403*|*"not authorized"*|*"Permission"*|*"permission"*|*"denied"*|*"read-only"*|*"not allowed to push"*)
-                # Same as for reading: the token may be the only thing standing
-                # in the way, because it displaced the key or helper that could
-                # have pushed. Ask git with its own configuration before this
-                # run ends over a credential it was handed.
-                probe_plain=""
-                [ -n "$OUTPUT_GIT_TOKEN" ] && probe_plain="$(push_probe "$OUTPUT_REPO" without-token)"
-                case "$probe_plain" in
-                    *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*)
-                        OUTPUT_GIT_TOKEN=""
-                        warn "the output token may not write to $OUTPUT_REPO, but git's own credentials may — dropping the token for this run"
-                        ok "the credentials may write to $OUTPUT_REPO"
-                        pf_pass "repo access" "readable and writable · without the configured token" ;;
-                    *)  # A probe is evidence, not a verdict: it asks about a
-                        # deletion, the run performs a push, and a host may
-                        # answer the two differently — an empty repository in
-                        # particular. So it warns and the push decides, which is
-                        # also the only reading under which a credential this
-                        # run cannot judge does not cost the run.
-                        warn "the credentials for $OUTPUT_REPO may read it but not write to it, as far as this probe can tell — the run continues and the push at the end decides:
-      · a fine-grained token needs 'Contents: read and write' on that repository — 'Administration' creates repositories and does not push to them
-      · a classic token needs the 'repo' scope
-      · an ssh URL (git@…) pushes with your key and needs no token at all
-      the host said: ${probe_text:-nothing}"
-                        pf_warn "repo access" "readable · the write probe was refused, the push will decide" ;;
-                esac ;;
-            *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*|"")
-                ok "the credentials may write to $OUTPUT_REPO"
-                pf_pass "repo access" "readable and writable" ;;
-            *)  # An unexpected answer says nothing either way, and a probe is no
-                # reason to stop a scan. The push has its own diagnostics.
-                warn "could not tell whether the credentials may write to $OUTPUT_REPO — the push will decide: $probe_text" ;;
-        esac
-    elif [ "$OUTPUT_REPO_PUSH" = "1" ]; then
-        # Reading it was proven above, writing was not, and this run will push.
-        # A row that names which of the two was tested beats a block that leaves
-        # the reader to work out which check the configuration switched off.
-        pf_warn "repo access" "readable · write access not probed (VERIFY_PUSH=0)"
-    else
-        pf_pass "repo access" "readable · the run commits without pushing (OUTPUT_REPO_PUSH=0)"
+
+    if [ "$OUTPUT_REPO_WILL_CREATE" = "0" ]; then
+        check_remote_repo "$OUTPUT_REPO" "the output repository" output 1
+        if [ -n "$OUTPUT_REPO_BRANCH" ]; then
+            GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output ls-remote --exit-code --heads -- "$OUTPUT_REPO" "$OUTPUT_REPO_BRANCH" >/dev/null 2>&1 \
+                || die "branch '$OUTPUT_REPO_BRANCH' does not exist in $OUTPUT_REPO — create it first, publishing does not open new branches"
+        fi
+        # A read-only token passes ls-remote and fails the push, so reading proves
+        # nothing about writing.
+        if [ "$VERIFY_PUSH" = "1" ] && [ "$OUTPUT_REPO_PUSH" = "1" ]; then
+            probe_text="$(push_probe "$OUTPUT_REPO" with-token)"
+            case "$probe_text" in
+                *403*|*"not authorized"*|*"Permission"*|*"permission"*|*"denied"*|*"read-only"*|*"not allowed to push"*)
+                    # Same as for reading: the token may be the only thing standing
+                    # in the way, because it displaced the key or helper that could
+                    # have pushed. Ask git with its own configuration before this
+                    # run ends over a credential it was handed.
+                    probe_plain=""
+                    [ -n "$OUTPUT_GIT_TOKEN" ] && probe_plain="$(push_probe "$OUTPUT_REPO" without-token)"
+                    case "$probe_plain" in
+                        *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*)
+                            OUTPUT_GIT_TOKEN=""
+                            warn "the output token may not write to $OUTPUT_REPO, but git's own credentials may — dropping the token for this run"
+                            ok "the credentials may write to $OUTPUT_REPO"
+                            pf_pass "repo access" "readable and writable · without the configured token" ;;
+                        *)  # A probe is evidence, not a verdict: it asks about a
+                            # deletion, the run performs a push, and a host may
+                            # answer the two differently — an empty repository in
+                            # particular. So it warns and the push decides, which is
+                            # also the only reading under which a credential this
+                            # run cannot judge does not cost the run.
+                            warn "the credentials for $OUTPUT_REPO may read it but not write to it, as far as this probe can tell — the run continues and the push at the end decides:
+          · a fine-grained token needs 'Contents: read and write' on that repository — 'Administration' creates repositories and does not push to them
+          · a classic token needs the 'repo' scope
+          · an ssh URL (git@…) pushes with your key and needs no token at all
+          the host said: ${probe_text:-nothing}"
+                            pf_warn "repo access" "readable · the write probe was refused, the push will decide" ;;
+                    esac ;;
+                *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*|"")
+                    ok "the credentials may write to $OUTPUT_REPO"
+                    pf_pass "repo access" "readable and writable" ;;
+                *)  # An unexpected answer says nothing either way, and a probe is no
+                    # reason to stop a scan. The push has its own diagnostics.
+                    warn "could not tell whether the credentials may write to $OUTPUT_REPO — the push will decide: $probe_text" ;;
+            esac
+        elif [ "$OUTPUT_REPO_PUSH" = "1" ]; then
+            # Reading it was proven above, writing was not, and this run will push.
+            # A row that names which of the two was tested beats a block that leaves
+            # the reader to work out which check the configuration switched off.
+            pf_warn "repo access" "readable · write access not probed (VERIFY_PUSH=0)"
+        else
+            pf_pass "repo access" "readable · the run commits without pushing (OUTPUT_REPO_PUSH=0)"
+        fi
+        ok "report will be published to $OUTPUT_REPO in $OUTPUT_REPO_PATH/"
+        pf_pass "publish to" "$OUTPUT_REPO · $OUTPUT_REPO_PATH/"
+        [ "${REMOTE_EMPTY:-0}" = "1" ] && detail "the repository is still empty — this run publishes the first report into it"
     fi
-    ok "report will be published to $OUTPUT_REPO in $OUTPUT_REPO_PATH/"
-    pf_pass "publish to" "$OUTPUT_REPO · $OUTPUT_REPO_PATH/"
-    [ "${REMOTE_EMPTY:-0}" = "1" ] && detail "the repository is still empty — this run publishes the first report into it"
 else
     # A run that publishes nothing is a normal run, so this is no warning. It is
     # in the block because the absence is what nobody sees: a command line that
@@ -1971,6 +2047,13 @@ if [ -n "$OUTPUT_REPO" ]; then
     # Where a failed publish leaves the report. In a temporary staging directory
     # that is true only until the next publishing run of this target clears it,
     # and a report that cost an hour deserves to say so before then.
+    # Now, and not in the preflight: a repository is a side effect, and a scan
+    # that died in its third hour must not leave one behind.
+    if [ "${OUTPUT_REPO_WILL_CREATE:-0}" = "1" ]; then
+        info "creating $OUTPUT_REPO — the report is finished and there is something to publish into it"
+        create_output_repo "$OUTPUT_REPO"
+    fi
+
     KEEP_NOTE="the report is complete in $OUTPUT_DIR"
     [ "${OUTPUT_DIR_STAGING:-0}" = "1" ] \
         && KEEP_NOTE="$KEEP_NOTE — a temporary directory the next publishing run of this target clears, so move it if you need it"
