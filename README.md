@@ -27,6 +27,26 @@ The report lands in `./appsec-reports/<target-slug>/` unless `--output-dir` says
 
 `--help` lists the options, `--help config` every configuration variable.
 
+### A run with everything spelled out
+
+```bash
+ADVISOR_REPO_URL=https://github.com/appsec-foundry/appsec-advisor \
+ASSESSMENT_DEPTH=quick \
+ADVISOR_REF=dev \
+./create-threat-model.sh --target-repo https://github.com/juice-shop/juice-shop \
+    --output-repo https://github.com/example/appsec-reports \
+    --console-log --create-output-repo --max-budget 30
+```
+
+- `ADVISOR_REPO_URL` — where the plugin is cloned from; the value above is the default, set it for a fork or a mirror.
+- `ASSESSMENT_DEPTH=quick` — shallowest of `quick`, `standard` (default), `thorough`.
+- `ADVISOR_REF=dev` — plugin ref to run: branch, tag or commit. Default `latest` = newest release tag.
+- `--target-repo <url>` — clone and scan that repository, here at its default branch.
+- `--output-repo <url>` — publish the artifacts there, under `reports/<target-slug>`.
+- `--create-output-repo` — create it, private, when it is missing. Needs `OUTPUT_GIT_TOKEN` with creation rights.
+- `--console-log` — keep the script's own output as `console.log` and publish it too.
+- `--max-budget 30` — stop above $30 estimated cost. API billing only.
+
 ## repo_profile.py
 
 Answers what a scan would read, before it costs anything. One directory walk, no agents, no model, no network, no credential, and no file content is read, so it is safe to point at code you have not looked at yet. It says nothing about security; that is what the threat model is for.
