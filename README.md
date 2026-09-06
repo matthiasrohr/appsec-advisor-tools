@@ -25,7 +25,7 @@ ASSESSMENT_DEPTH=thorough WITH_SARIF=1 FAIL_ON=high ./create-threat-model.sh --t
 
 The report lands in `./appsec-reports/<target-slug>/` unless `--output-dir` says otherwise: `threat-model.md` and `threat-model.yaml`, the SARIF, Threat Dragon, PDF and HTML variants where the run was asked for them, `pentest-tasks.yaml` when `--url` named a running instance, and `run.log`. That directory is git-ignored in this repository.
 
-A run with `--output-repo` reads its report from that repository, so the local directory is only where the scan works and the publish step copies from. It moves to `$TMPDIR/appsec-advisor/<target-slug>` for that reason, and the current directory stays clean. That directory is cleared at the start of every publishing run, without asking — what it held was published, and keeping one per run would leave the intermediates of every run ever started behind. The flip side is that such a run starts from nothing every time: no earlier model, no changelog against the last assessment, new finding IDs. `--output-dir` or `OUTPUT_DIR_BASE` names a stable directory instead, publishing or not, and nothing there is ever cleared.
+A run with `--output-repo` works in `$TMPDIR/appsec-advisor/<target-slug>` instead and clears that directory first, so the current one stays clean and nothing piles up. Such a run starts from nothing: no earlier model, no changelog, new finding IDs. `--output-dir` and `OUTPUT_DIR_BASE` keep a stable directory, which is never cleared.
 
 `--help` lists the options, `--help config` every configuration variable.
 
@@ -45,9 +45,9 @@ WITH_REQUIREMENTS=1 \
 - `ADVISOR_REPO_URL` — where the plugin is cloned from; the value above is the default, set it for a fork or a mirror.
 - `ADVISOR_REF=dev` — plugin ref to run: branch, tag or commit. Default `latest` = newest release tag.
 - `ASSESSMENT_DEPTH=quick` — shallowest of `quick`, `standard` (default), `thorough`.
-- `WITH_REQUIREMENTS=1` — grade the findings against the requirements catalog the plugin is configured with; there is no launcher flag for it, the variable is what passes `--requirements` to the run.
+- `WITH_REQUIREMENTS=1` — grade the findings against the plugin's requirements catalog. There is no launcher flag for it; the variable passes `--requirements` to the run.
 - `--target-repo <url>` — clone and scan that repository, here at its default branch.
-- `--url http://localhost:3000` — where that repository is running. The scan stays static; the URL only ends up in `pentest-tasks.yaml`, as the target of the Strix tasks.
+- `--url http://localhost:3000` — where the target runs. The scan stays static; the URL only ends up in `pentest-tasks.yaml`.
 - `--output-repo <url>` — publish the artifacts there, under `reports/<target-slug>`.
 - `--create-output-repo` — create it, private, when it is missing. Needs `OUTPUT_GIT_TOKEN` with creation rights.
 - `--console-log` — keep the script's own output as `console.log` and publish it too.
@@ -98,9 +98,9 @@ KEY_SOURCE=aws AWS_SECRET_ID=appsec-advisor/anthropic-api-key \
 
 Reading a private target repository and writing a report repository take separate credentials, because they are separate privileges: `TARGET_GIT_TOKEN` or `TARGET_GIT_TOKEN_FILE` for `--target-repo`, `OUTPUT_GIT_TOKEN` or `OUTPUT_GIT_TOKEN_FILE` for `--output-repo`. Tokens reach git through a credential helper, so they show up neither in the process list nor in the clone's `.git/config`.
 
-Where both repositories live in the same place, one credential does: `GIT_TOKEN` (or `GIT_TOKEN_FILE`, and `GIT_USER` for the account name) is what both pairs fall back to, and the specific variable still wins wherever it is set. One credential for two hosts is the case to think about — the helper answers whatever git asks it about, so the same secret is offered to both — and a run that does that says so in its preflight.
+Where both live in the same place, one credential does: `GIT_TOKEN`, `GIT_TOKEN_FILE` and `GIT_USER` are what both pairs fall back to, and the specific variables still win. Across two hosts the same secret is offered to both, and the preflight says so.
 
-Creating the report repository with `--create-output-repo` is the one thing a git credential cannot do: the repository is made through the host's API, so it needs `OUTPUT_GIT_TOKEN` (or `GIT_TOKEN`) with `repo` on GitHub or `api` on GitLab, which is more than pushing needs. Publishing into a repository that already exists needs no token at all when the URL is an ssh one — that push travels on your key.
+`--create-output-repo` is the one thing a git credential cannot do: the repository is made through the host's API, so the token needs `repo` on GitHub or `api` on GitLab. Publishing into a repository that exists needs no token at all over an ssh URL.
 
 ### Publishing
 
