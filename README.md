@@ -39,7 +39,7 @@ WITH_REQUIREMENTS=1 \
 ./create-threat-model.sh --target-repo https://github.com/juice-shop/juice-shop \
     --url http://localhost:3000 \
     --output-repo https://github.com/example/juice-shop-report \
-    --create-output-repo --console-log --max-budget 30
+    --create-output-repo --console-log --soft-budget 30
 ```
 
 - `ADVISOR_REPO_URL` — where the plugin is cloned from; the value above is the default, set it for a fork or a mirror.
@@ -51,7 +51,7 @@ WITH_REQUIREMENTS=1 \
 - `--output-repo <url>` — publish the artifacts there, under `reports/<target-slug>`.
 - `--create-output-repo` — create it, private, when it is missing. Needs `OUTPUT_GIT_TOKEN` with creation rights.
 - `--console-log` — keep the script's own output as `console.log` and publish it too.
-- `--max-budget 30` — stop above $30 estimated cost. API billing only.
+- `--soft-budget 30` — steer the run to $30: one that cannot fit does not start, one that overruns still finishes. `--hard-budget` is the cut that kills the session, API billing only, and the runner derives it at 1.25 × the soft budget.
 
 ## repo_profile.py
 

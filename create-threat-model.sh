@@ -115,9 +115,16 @@ SCAN_MODE="${SCAN_MODE:-standard}"
 ASSUME_YES="${ASSUME_YES:-0}"                     # 1 → same as --yes
 FAIL_ON="${FAIL_ON:-}"                            # critical | high | medium → non-zero exit
 MAX_DURATION="${MAX_DURATION:-}"                  # seconds; empty = no wall-clock limit
-# Spend cap in USD, also settable per run with --max-budget. It only bites under
-# API billing; a subscription run is not metered in dollars.
-MAX_BUDGET="${MAX_BUDGET:-}"
+# The two budgets the plugin knows, in USD, and they do different jobs.
+# SOFT_BUDGET (--soft-budget) steers: a run whose projected cost cannot fit is
+# refused before it spends anything, a run that overruns still finishes, and it
+# works under a subscription too, where the figures value tokens against the
+# price table. MAX_BUDGET (--hard-budget, and --max-budget as the older
+# spelling) is the cut: it kills the session and leaves no report, and it only
+# bites under API billing. Given only a soft budget, the runner derives the hard
+# one at 1.25 x — that derivation stays there, this script passes through.
+SOFT_BUDGET="${SOFT_BUDGET:-}"
+MAX_BUDGET="${MAX_BUDGET:-${HARD_BUDGET:-}}"
 
 # ── Authentication ───────────────────────────────────────────────────────────
 # auto         = use a service key when one is configured, else the subscription
@@ -382,8 +389,14 @@ Options:
                          analysis that was never rendered offers the render,
                          and what an interrupted analysis left is rebuilt.
                          Unattended, each of the three takes the first option.
-  --max-budget  <usd>    Stop the run when the estimated cost exceeds this
-                         amount. API billing only (MAX_BUDGET sets a default).
+  --soft-budget <usd>    Steer the run to this cost: one whose projected cost
+                         cannot fit does not start, one that overruns still
+                         finishes. Not a cap, and it works under a subscription
+                         too (SOFT_BUDGET sets a default).
+  --hard-budget <usd>    Kill the session at this cost, losing the report. API
+                         billing only, and derived at 1.25 x the soft budget
+                         when only that is given (MAX_BUDGET sets a default,
+                         --max-budget is the older spelling).
   --save-runtime-files   Keep the run's intermediate files in the output
                          directory (--keep-runtime-files) and publish those
                          RUNTIME_FILES names under runtime/, each one only
@@ -456,7 +469,9 @@ Plugin and scan:
       which intermediates may be published; each is scanned for secrets first,
       and every other intermediate stays in the output directory
   PENTEST_URL=<http(s) url>         (same as --url) Strix pentest tasks for that URL
-  FAIL_ON=critical|high|medium      MAX_DURATION=<seconds>   MAX_BUDGET=<usd>
+  FAIL_ON=critical|high|medium      MAX_DURATION=<seconds>
+  SOFT_BUDGET=<usd>   steers the run and never kills it; works on a subscription
+  MAX_BUDGET=<usd>    the hard cut, API billing only; HARD_BUDGET is a synonym
 
 Service key (the key value never belongs in this file, only its source):
   AUTH_MODE=auto|api-key|subscription
@@ -486,6 +501,11 @@ INVOCATION="$(printf '%q ' "$0" "$@")"; INVOCATION="${INVOCATION% }"
 
 TARGET_DIR=""; TARGET_REPO=""; TARGET_REF=""; OUTPUT_DIR=""; PROFILE_ONLY=0
 while [ $# -gt 0 ]; do
+    # --flag=value is what everyone types, and refusing it teaches nobody
+    # anything: split it and let the same case arm handle both spellings.
+    case "$1" in
+        --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}"; continue ;;
+    esac
     case "$1" in
         --profile-only) PROFILE_ONLY=1; shift ;;
         --target-dir)  TARGET_DIR="${2:?--target-dir needs a path}";  shift 2 ;;
@@ -498,7 +518,9 @@ while [ $# -gt 0 ]; do
         --output-repo) OUTPUT_REPO="${2:?--output-repo needs a git URL}"; shift 2 ;;
         --create-output-repo) OUTPUT_REPO_CREATE=1; shift ;;
         --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; MODE_EXPLICIT=1; shift 2 ;;
-        --max-budget)  MAX_BUDGET="${2:?--max-budget needs an amount in USD}"; shift 2 ;;
+        --soft-budget) SOFT_BUDGET="${2:?--soft-budget needs an amount in USD}"; shift 2 ;;
+        --hard-budget|--max-budget)
+                       MAX_BUDGET="${2:?--hard-budget needs an amount in USD}"; shift 2 ;;
         --console-log) SAVE_CONSOLE_LOG=1; shift ;;
         --save-runtime-files) SAVE_RUNTIME_FILES=1; shift ;;
         -y|--yes)      ASSUME_YES=1; shift ;;
@@ -564,7 +586,10 @@ case "$AUTH_MODE"        in auto|api-key|subscription) ;; *) die "AUTH_MODE must
 case "$KEY_SOURCE"       in auto|aws|cmd|file|env) ;; *) die "KEY_SOURCE must be auto, aws, cmd, file or env (got: $KEY_SOURCE)" ;; esac
 case "$KEY_FETCH_TIMEOUT" in ''|*[!0-9]*) die "KEY_FETCH_TIMEOUT must be a whole number of seconds (got: $KEY_FETCH_TIMEOUT)" ;; esac
 [ -z "$MAX_BUDGET" ] || case "$MAX_BUDGET" in
-    *[!0-9.]*|.*|*.*.*|0|0.0|0.00) die "--max-budget must be a positive amount in USD (got: $MAX_BUDGET)" ;;
+    *[!0-9.]*|.*|*.*.*|0|0.0|0.00) die "--hard-budget must be a positive amount in USD (got: $MAX_BUDGET)" ;;
+esac
+[ -z "$SOFT_BUDGET" ] || case "$SOFT_BUDGET" in
+    *[!0-9.]*|.*|*.*.*|0|0.0|0.00) die "--soft-budget must be a positive amount in USD (got: $SOFT_BUDGET)" ;;
 esac
 [ -z "$MAX_DURATION" ] || case "$MAX_DURATION" in *[!0-9]*) die "MAX_DURATION must be a whole number of seconds (got: $MAX_DURATION)" ;; esac
 [ -z "$FAIL_ON" ] || case "$FAIL_ON" in critical|high|medium) ;; *) die "FAIL_ON must be critical, high or medium (got: $FAIL_ON)" ;; esac
@@ -1058,10 +1083,12 @@ print(str(data[field]))
     KEY_ORIGIN="$origin"
     AUTH_DESC="API key from $origin (${#key} chars)"
     info "auth: $AUTH_DESC — billed per token, not against the subscription"
-    if [ -n "$MAX_BUDGET" ]; then
-        info "spend cap: \$$MAX_BUDGET"
+    if [ -n "$SOFT_BUDGET" ] || [ -n "$MAX_BUDGET" ]; then
+        info "budget:${SOFT_BUDGET:+ steer at \$$SOFT_BUDGET}${MAX_BUDGET:+ · cut at \$$MAX_BUDGET}"
+        [ -n "$SOFT_BUDGET" ] && [ -z "$MAX_BUDGET" ] \
+            && detail "the runner derives its hard cut from that, at 1.25 x — --hard-budget sets it yourself"
     else
-        warn "no spend cap for this API-billed run — set --max-budget <usd> or MAX_BUDGET"
+        warn "no budget for this API-billed run — set --soft-budget <usd> to steer it, --hard-budget <usd> to cut it off"
     fi
 }
 
@@ -1123,7 +1150,7 @@ else
 
     resolve_auth
     if [ -n "$MAX_BUDGET" ] && [ "${KEY_SOURCE_EFFECTIVE:-none}" = "none" ]; then
-        warn "a spend cap only limits API-billed runs; this one bills against the subscription, so \$$MAX_BUDGET is ignored"
+        warn "a hard budget cuts off API-billed runs only; this one bills against the subscription, so \$$MAX_BUDGET is ignored${SOFT_BUDGET:+ — the soft budget still steers it}"
     fi
     AUTH_VERIFIED=0
     case "$VERIFY_AUTH" in
@@ -1737,7 +1764,8 @@ if [ "$DISCARD_STAGE1" = "1" ]; then ARGS+=(--force); fi
 [ -n "$SESSION_MODEL" ]         && ARGS+=(--model "$SESSION_MODEL")
 [ -n "$REASONING_MODEL" ]       && ARGS+=(--reasoning-model "$REASONING_MODEL")
 [ -n "$MAX_DURATION" ]          && ARGS+=(--max-duration "$MAX_DURATION")
-[ -n "$MAX_BUDGET" ]            && ARGS+=(--max-budget "$MAX_BUDGET")
+[ -n "$SOFT_BUDGET" ]           && ARGS+=(--soft-budget "$SOFT_BUDGET")
+[ -n "$MAX_BUDGET" ]            && ARGS+=(--hard-budget "$MAX_BUDGET")
 [ -n "$FAIL_ON" ]               && ARGS+=(--fail-on "$FAIL_ON")
 # No context source, no context: --skip-context settles it for the run instead
 # of leaving the analysis to pick up whatever docs/business-context.md the
