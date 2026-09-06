@@ -9,7 +9,8 @@
 #         file: ci/gitlab/threat-model.gitlab-ci.yml
 #
 # Run it from CI/CD → Pipelines → Run pipeline: the variables below appear as a
-# form, prefilled with these values.
+# form, prefilled with these values. That is the only way it runs — nothing here
+# starts by itself.
 #
 # Two things this file cannot supply:
 #   · the image. It needs the Claude Code CLI (Node) and python3 with pyyaml and
@@ -73,9 +74,15 @@ threat-model:
     key: appsec-advisor-$ADVISOR_REF
     paths:
       - .cache/appsec-advisor      # the plugin clone, so every run does not refetch it
+  # Never on its own. A run costs money and reads a repository someone named, so
+  # it starts where a person names it: CI/CD → Pipelines → Run pipeline. A push,
+  # a merge request, a schedule or an API trigger creates no pipeline with this
+  # job in it, and where the file is included in a larger pipeline the job still
+  # waits for the play button rather than starting with the rest.
   rules:
-    - if: $CI_PIPELINE_SOURCE == "web"        # started from the Run pipeline form
-    - if: $CI_PIPELINE_SOURCE == "schedule"   # or nightly, with its own variables
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  allow_failure: false
   before_script:
     - test -n "$TARGET_REPO" || { echo "TARGET_REPO is empty — name the repository to scan"; exit 1; }
     - test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY is not set — add it as a masked, protected CI/CD variable"; exit 1; }

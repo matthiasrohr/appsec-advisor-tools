@@ -55,7 +55,7 @@ WITH_REQUIREMENTS=1 \
 
 ### In a pipeline
 
-`ci/gitlab/threat-model.gitlab-ci.yml` runs the launcher as a GitLab pipeline, with every setting as a prefilled variable and one that has to be filled in: `TARGET_REPO`. The `script:` line is `./create-threat-model.sh` and nothing else — everything reaches the run through the environment. `ci/gitlab/Dockerfile` builds the image it needs, since the Claude Code CLI and the two Python packages are not in any stock image.
+`ci/gitlab/threat-model.gitlab-ci.yml` runs the launcher as a GitLab pipeline, started by hand and never by itself, with every setting as a prefilled variable and one that has to be filled in: `TARGET_REPO`. The `script:` line is `./create-threat-model.sh` and nothing else — everything reaches the run through the environment. `ci/gitlab/Dockerfile` builds the image it needs, since the Claude Code CLI and the two Python packages are not in any stock image.
 
 A pipeline has no Claude subscription, so a run there is billed per token. That is what `SOFT_BUDGET` is for, and the run refuses to start when its projection does not fit.
 
