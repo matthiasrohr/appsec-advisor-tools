@@ -57,7 +57,7 @@ WITH_REQUIREMENTS=1 \
 
 `ci/gitlab/threat-model.gitlab-ci.yml` runs the launcher as a GitLab pipeline, started by hand and never by itself, with every setting as a prefilled variable and one that has to be filled in: `TARGET_REPO`. The `script:` line is `./create-threat-model.sh` and nothing else — everything reaches the run through the environment. `ci/gitlab/Dockerfile` builds the image it needs, since the Claude Code CLI and the two Python packages are not in any stock image.
 
-`.github/workflows/threat-model.yml` is the same thing for GitHub Actions, started from Actions → Threat model → Run workflow. It needs no image: the standard runner has Node and Python, and the workflow installs the CLI and the two packages itself. GitHub runs workflows only from `.github/workflows`, so that one cannot live in a subdirectory of its own.
+`ci/github/threat-model.yml` is the same thing for GitHub Actions, started from Actions → Threat model → Run workflow. It needs no image: the standard runner has Node and Python, and the workflow installs the CLI and the two packages itself. Both files are templates for the repository that runs the scans — the GitLab one through the CI configuration path in its settings, the GitHub one copied into `.github/workflows/`, which is the only place GitHub reads workflows from.
 
 Neither has a Claude subscription, so a run there is billed per token. That is what `SOFT_BUDGET` is for, and the run refuses to start when its projection does not fit. Both take `PROFILE_ONLY` for a first run that measures the target and stops, without a key and without cost.
 

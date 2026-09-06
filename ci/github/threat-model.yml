@@ -1,10 +1,17 @@
 # Threat model as a GitHub workflow, the counterpart of
-# ci/gitlab/threat-model.gitlab-ci.yml. It lives here and nowhere else: GitHub
-# only runs workflows from .github/workflows, the path is not configurable.
+# ci/gitlab/threat-model.gitlab-ci.yml. It is a template, not a workflow of this
+# repository: copy it into the repository that should run the scans, where
+# GitHub reads workflows and nowhere else —
+#
+#     cp ci/github/threat-model.yml <that repo>/.github/workflows/
+#
+# and commit it on the default branch, which is where GitHub looks for
+# dispatchable workflows. Where the launcher is not in that repository, the
+# checkout step needs a second one for appsec-advisor-tools, and the run step
+# the path to it.
 #
 # workflow_dispatch is the only trigger, so nothing starts by itself. The form
-# appears under Actions → Threat model → Run workflow, once this file is on the
-# default branch — GitHub reads dispatchable workflows from there.
+# is then under Actions → Threat model → Run workflow.
 #
 # Two secrets, under Settings → Secrets and variables → Actions:
 #   ANTHROPIC_API_KEY   a run here is billed per token; there is no subscription
