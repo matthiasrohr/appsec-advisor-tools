@@ -305,6 +305,22 @@ ask_choice() {
     printf '        choice: '
     read -r reply || reply=""
     printf '\n'
+    # A command line pasted into a terminal is executed line by line, and a line
+    # that ends without a backslash ends the command. The lines after it are
+    # typed at whatever is prompting by then — here, at this question, which
+    # takes them as an answer and moves on. The flags never reached the run, and
+    # nothing downstream can tell. An answer that begins with a dash is that
+    # accident, not a choice, and it is the only reading that makes sense.
+    case "$reply" in
+        -*) die "that reads like the rest of a command line, pasted into this question: '$reply'
+
+      This run was started as:
+        $INVOCATION
+
+      Those flags are not part of it — the line before them ended without a
+      trailing backslash, so the shell sent the command without them. Nothing
+      has been scanned. Start again with the whole command on one line." ;;
+    esac
     reply="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
     # Split on the separator rather than matching a pattern: a "|" that arrives
     # inside a variable is a character to case, not an alternation.
