@@ -40,8 +40,8 @@ variables:
     value: "30"
     description: "Steer the run to this many USD. A projection that cannot fit refuses the run; an overrun still finishes."
   MAX_DURATION:
-    value: "5400"
-    description: "Abort the run after this many seconds."
+    value: "19800"
+    description: "The run ends itself after this many seconds. Keep it under the job timeout below, so the run stops on its own terms and the artifacts are still written."
   ADVISOR_REPO_URL:
     value: "https://github.com/appsec-foundry/appsec-advisor"
     description: "Where the plugin is cloned from. Change it for a fork or a mirror."
@@ -61,7 +61,11 @@ variables:
 threat-model:
   stage: test
   image: $CI_REGISTRY_IMAGE/appsec-advisor:latest
-  timeout: 3h
+  # An assessment runs for hours: a quick scan of a mid-sized repository takes
+  # about an hour, thorough on a monorepo several. This value overrides the
+  # project's default timeout, but not the runner's `maximum_timeout` — where a
+  # job dies at exactly 60 minutes, that is the runner's setting, not this line.
+  timeout: 6h
   variables:
     KEY_SOURCE: env              # ANTHROPIC_API_KEY comes from the CI/CD variables
     SAVE_CONSOLE_LOG: "1"        # keep this job's own output next to the report

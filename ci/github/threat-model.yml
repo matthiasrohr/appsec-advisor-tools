@@ -53,6 +53,10 @@ on:
         description: "Create the report repository when it is missing — after the scan, so a failed run leaves nothing behind"
         type: boolean
         default: true
+      max_duration:
+        description: "The run ends itself after this many seconds. Keep it under the job timeout, so the report and the log are still uploaded"
+        required: false
+        default: "18000"
       profile_only:
         description: "Measure the target and stop: no model, no credential, no cost. The cheapest way to test this workflow"
         type: boolean
@@ -64,7 +68,10 @@ permissions:
 jobs:
   threat-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # An assessment runs for hours. A GitHub-hosted runner is killed after six
+    # of them whatever stands here, so this sits just below that; a self-hosted
+    # runner has no such ceiling and takes a larger number.
+    timeout-minutes: 350
     steps:
       # Pinned to commits rather than tags: a tag can be moved to other code,
       # a commit cannot.
@@ -93,7 +100,7 @@ jobs:
           ADVISOR_REF: ${{ inputs.advisor_ref }}
           ASSESSMENT_DEPTH: ${{ inputs.assessment_depth }}
           SOFT_BUDGET: ${{ inputs.soft_budget }}
-          MAX_DURATION: "9000"
+          MAX_DURATION: ${{ inputs.max_duration }}
           OUTPUT_DIR: ${{ github.workspace }}/report
           SAVE_CONSOLE_LOG: "1"
           ASSUME_YES: "1"
