@@ -946,13 +946,14 @@ create_output_repo() {  # create_output_repo <url>
     code="${out##*$'\n'}"; body="${out%$'\n'*}"
     case "$code" in
         200|201)
-            REMOTE_CREATED=1
+            REMOTE_CREATED=1; REMOTE_CONFIRMED=1
             ok "created $url as a private repository" ;;
         # Someone else created it between the check and here. That is the state
         # this was asked for, so it is not an error.
         400|422)
             case "$body" in
                 *"already exists"*|*"already been taken"*|*"has already been"*)
+                    REMOTE_CONFIRMED=1
                     warn "$url already existed after all — publishing into it" ;;
                 *)  msg="$(printf '%s' "$body" | json_field message)"
                     die "the host refused to create $url (HTTP $code)${msg:+: $msg}" ;;
@@ -999,6 +1000,27 @@ check_remote_repo() {  # check_remote_repo <url> <description> [none|target|outp
     text="$(tr -d '\r' <"$err" | tr '\n' ' ')"
     rm -f "$err"
     [ "$rc" -eq 0 ] && return 0
+
+    # A token that is set but cannot see this repository does not just fail — it
+    # displaces the credentials that could. git_auth clears the user's helper and
+    # offers only the token, so an ssh key or a working helper never gets asked.
+    # Before giving up, ask git with its own configuration; if that reaches the
+    # repository, the run carries on without the token and says so.
+    if { [ "$creds" = "target" ] && [ -n "$TARGET_GIT_TOKEN" ]; } \
+            || { [ "$creds" = "output" ] && [ -n "$OUTPUT_GIT_TOKEN" ]; }; then
+        local rc2=0
+        GIT_TERMINAL_PROMPT=0 run_bounded git ls-remote --quiet --exit-code -- "$url" HEAD >/dev/null 2>&1 || rc2=$?
+        if [ "$rc2" -eq 0 ] || { [ "$rc2" -eq 2 ] && [ "$allow_empty" = "1" ]; }; then
+            [ "$rc2" -eq 2 ] && REMOTE_EMPTY=1
+            case "$creds" in
+                target) TARGET_GIT_TOKEN=""
+                        warn "the target token cannot see $url, but git's own credentials can — dropping the token for this run" ;;
+                output) OUTPUT_GIT_TOKEN=""
+                        warn "the output token cannot see $url, but git's own credentials can — dropping the token for this run" ;;
+            esac
+            return 0
+        fi
+    fi
     case "$rc" in
         2)   # An empty repository has nothing to scan, but it is a perfectly
              # good place to publish the first report into.
@@ -1016,11 +1038,11 @@ check_remote_repo() {  # check_remote_repo <url> <description> [none|target|outp
             # private repository the credentials may not see, so "not found"
             # here is about the credentials, and saying "does not exist" would
             # send someone looking for the wrong thing.
-            [ "${REMOTE_CREATED:-0}" = "1" ] && die "$url was created through the host's API just now, so it exists — but git cannot see it with these credentials:
+            [ "${REMOTE_CONFIRMED:-0}" = "1" ] && die "the host's API confirms $url exists — git cannot see it with these credentials:
       · the account name in use is '${OUTPUT_GIT_USER:-}' — GitHub wants x-access-token here, GitLab oauth2
       · a fine-grained token limited to selected repositories does not cover one created after it was issued; give it access to the new repository, or use a token with the 'repo' scope
       · an ssh URL (git@…) avoids the question — that push travels on your key
-      The repository stays; the next run does not need --create-output-repo"
+      The repository is there either way; the next run does not need --create-output-repo"
             die "$what does not exist, or the credentials in use cannot see it: $url" ;;
         *"could not read Username"*|*"terminal prompts disabled"*)
             # A private and a missing repository look identical over https: the
