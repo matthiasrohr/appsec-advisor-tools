@@ -76,6 +76,12 @@ WITH_THREATDRAGON="${WITH_THREATDRAGON:-0}"       # 1 → threat-model.threatdra
 WITH_REQUIREMENTS="${WITH_REQUIREMENTS:-0}"       # 1 → run the requirements check
 WITH_PDF="${WITH_PDF:-0}"                         # 1 → threat-model.pdf (needs pandoc + weasyprint)
 WITH_HTML="${WITH_HTML:-0}"                       # 1 → threat-model.html
+# Keep the run's intermediate files instead of letting runtime_cleanup.py take
+# them, and publish a named few of them under runtime/ in the report path. They
+# carry raw excerpts of the scanned repository, so only what RUNTIME_FILES names
+# travels, and only after the plugin's own secret scanner has looked at it.
+SAVE_RUNTIME_FILES="${SAVE_RUNTIME_FILES:-0}"     # 1 → same as --save-runtime-files
+RUNTIME_FILES="${RUNTIME_FILES:-.hook-events.log .agent-run.log .skill-config.json}"
 # Base URL of the running instance of the target. Set it, and the run also
 # builds the Strix pentest task set for that URL; empty = no pentest tasks.
 PENTEST_URL="${PENTEST_URL:-}"                    # also settable per run with --url
@@ -133,12 +139,18 @@ KEY_FETCH_TIMEOUT="${KEY_FETCH_TIMEOUT:-60}"  # seconds allowed for fetching the
 #   auto = only when a service key is used (run-headless.sh already checks the
 #          stored subscription credentials itself) | 1 = always | 0 = never
 VERIFY_AUTH="${VERIFY_AUTH:-auto}"
+
+# ls-remote answers whether the output repository can be read. Whether it can be
+# written is a different question and a different service on the same host, so
+# ask that one too before a scan runs for twenty minutes.
+#   1 = probe receive-pack | 0 = find out at the push
+VERIFY_PUSH="${VERIFY_PUSH:-1}"
 VERBOSITY="${VERBOSITY:-normal}"                  # quiet | normal | verbose
-# A copy of everything this script prints, in a file of your choosing. Also
-# settable per run with --console-log. The scan's own output is in run.log
-# either way; this one adds the steps around it and starts before the output
-# directory is even known.
-CONSOLE_LOG="${CONSOLE_LOG:-}"
+# Keep a copy of everything this script prints. It lands in the output directory
+# as console.log and is published with the other artifacts. The scan's own
+# output is in run.log either way; this one adds the steps around it. Also
+# settable per run with --console-log.
+SAVE_CONSOLE_LOG="${SAVE_CONSOLE_LOG:-0}"         # 1 → same as --console-log
 EXTRA_ARGS=()                                     # extra run-headless.sh flags
 
 # Business context for this run: an http(s) URL or a file path. Also settable
@@ -168,7 +180,14 @@ OUTPUT_REPO_PUSH="${OUTPUT_REPO_PUSH:-1}"            # 0 = commit locally, do no
 # Names or shell globs, matched inside the output directory. The figures are
 # what threat-model.md embeds by relative path — published without them, the
 # report shows two broken images.
-OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat-model.figure*.svg threat-model.sarif.json threat-model.threatdragon.json threat-model.pdf threat-model.html pentest-tasks.yaml}"
+# Create the repository when it is not there. Off by default: this is the one
+# thing here that creates something on a foreign host, and it needs a token that
+# may do more than push. What it creates is always private — a threat model
+# names findings and attack paths, and a repository's visibility cannot be
+# guessed on someone's behalf.
+OUTPUT_REPO_CREATE="${OUTPUT_REPO_CREATE:-0}"        # 1 → same as --create-output-repo
+OUTPUT_REPO_HOST="${OUTPUT_REPO_HOST:-auto}"         # auto | github | gitlab
+OUTPUT_REPO_FILES="${OUTPUT_REPO_FILES:-threat-model.md threat-model.yaml threat-model.figure*.svg threat-model.sarif.json threat-model.threatdragon.json threat-model.pdf threat-model.html pentest-tasks.yaml console.log}"
 
 # Write credentials for OUTPUT_REPO. Deliberately separate from the target ones:
 # reading a repository and writing to one are different privileges.
@@ -219,22 +238,52 @@ ok()    { printf '      %s✓%s %s\n' "$C_GREEN" "$C_NC" "$*"; }
 warn()  { printf '      %s⚠%s %s\n' "$C_YELLOW" "$C_NC" "$*" >&2; }
 die()   { printf '\n%s✗%s %s\n' "$C_RED" "$C_NC" "$*" >&2; exit 1; }
 
+# What the preflight established, collected as it goes and printed as one block
+# before the scan starts. The individual steps say what they are doing while
+# they do it; this is the list someone reads to see that everything that had to
+# hold, holds — in a CI log it is the one screen worth keeping.
+#   pf_pass <label> <what holds>   pf_warn <label> <what to know>
+PREFLIGHT=()
+pf_pass() { PREFLIGHT+=("pass|$1|${*:2}"); }
+pf_warn() { PREFLIGHT+=("warn|$1|${*:2}"); }
+preflight_summary() {
+    [ "${#PREFLIGHT[@]}" -gt 0 ] || return 0
+    local entry state label text rest
+    printf '\n      %spreflight%s\n\n' "$C_DIM" "$C_NC"
+    for entry in "${PREFLIGHT[@]}"; do
+        state="${entry%%|*}"; rest="${entry#*|}"
+        label="${rest%%|*}"; text="${rest#*|}"
+        case "$state" in
+            pass) printf '        %s✓%s  %s%-11s%s %s\n' "$C_GREEN" "$C_NC" "$C_DIM" "$label" "$C_NC" "$text" ;;
+            *)    printf '        %s⚠%s  %s%-11s%s %s\n' "$C_YELLOW" "$C_NC" "$C_DIM" "$label" "$C_NC" "$text" ;;
+        esac
+    done
+}
+
 # One shape for every question this script asks: what it found, then both ways
 # out with what each one costs, so the two are read side by side instead of one
 # after the answer. Returns 0 for the default and 1 for the keyed option.
-#   ask_choice <state> <default option> <[r] option> [<dim note>]
+#   ask_choice <state> <default option> <key[|word…]> <keyed option> [<dim note>]
+# The key may name alternatives, of which the first is the one offered.
 # Anything but the key takes the default, and the default is always the option
-# that destroys nothing — a typo at this prompt cannot clear an assessment.
+# that destroys nothing and creates nothing — a typo at this prompt cannot clear
+# an assessment, and it cannot make a repository either.
 ask_choice() {
-    local reply
+    local reply key="$3" keys="$3"
+    key="${key%%|*}"
     printf '\n      %s?%s %s\n' "$C_YELLOW" "$C_NC" "$1"
-    [ -n "${4:-}" ] && printf '        %s%s%s\n' "$C_DIM" "$4" "$C_NC"
+    [ -n "${5:-}" ] && printf '        %s%s%s\n' "$C_DIM" "$5" "$C_NC"
     printf '        %s[Enter]%s  %s\n' "$C_GREEN" "$C_NC" "$2"
-    printf '        %s[r]%s      %s\n' "$C_YELLOW" "$C_NC" "$3"
+    printf '        %s[%s]%s      %s\n' "$C_YELLOW" "$key" "$C_NC" "$4"
     printf '        choice: '
     read -r reply || reply=""
     printf '\n'
-    case "$reply" in r|R|rebuild) return 1 ;; *) return 0 ;; esac
+    reply="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+    # Split on the separator rather than matching a pattern: a "|" that arrives
+    # inside a variable is a character to case, not an alternation.
+    local IFS='|' k
+    for k in $keys; do [ "$reply" = "$k" ] && return 1; done
+    return 0
 }
 
 # Whether a question can be put to anybody at all: something has to be able to
@@ -267,6 +316,12 @@ Options:
   --target-ref  <ref>    Branch, tag or commit for --target-repo
   --output-dir  <dir>    Report directory (default: ./appsec-reports/<target-slug>)
   --output-repo <url>    Publish the finished report into this git repository
+  --create-output-repo   Create --output-repo on its host when it is not there,
+                         without asking. Always private. Needs OUTPUT_GIT_TOKEN
+                         with creation rights (GitHub: repo / GitLab: api),
+                         which is more than pushing needs. Without this flag an
+                         unreachable output repository is put to you as a
+                         question; unattended or with --yes, the run stops.
   --context     <src>    Business context for this run: http(s) URL or file path.
                          Without it the run passes --skip-context, so a
                          docs/business-context.md in the target stays unread.
@@ -283,9 +338,13 @@ Options:
                          Unattended, each of the three takes the first option.
   --max-budget  <usd>    Stop the run when the estimated cost exceeds this
                          amount. API billing only (MAX_BUDGET sets a default).
-  --console-log <file>   Append everything this script prints to <file>, colour
-                         codes stripped. The scan's own output is in run.log
-                         either way; this adds the steps around it.
+  --save-runtime-files   Keep the run's intermediate files in the output
+                         directory (--keep-runtime-files) and publish those
+                         RUNTIME_FILES names under runtime/, each one only
+                         after the plugin's secret scanner passed it
+  --console-log          Save everything this script prints to console.log in
+                         the output directory, colour codes stripped, and
+                         publish it with the report.
   -y, --yes              Answer every question with the option it defaults to
                          and never wait for input — for CI. Without a terminal
                          on stdin the run does this by itself.
@@ -320,9 +379,11 @@ Plugin and scan:
       group token; GitHub: TARGET_GIT_USER=x-access-token). ssh URLs use your key.
   OUTPUT_DIR_BASE=<dir>  parent of the report directory when --output-dir is omitted
   OUTPUT_REPO=<url>  OUTPUT_REPO_BRANCH=<branch>  OUTPUT_REPO_PATH=reports/<slug>
+  OUTPUT_REPO_CREATE=1   (same as --create-output-repo) create it when missing,
+      always private   OUTPUT_REPO_HOST=auto|github|gitlab  which API to use;
+      auto reads github.com as GitHub and everything else as GitLab
   OUTPUT_REPO_PUSH=1|0   OUTPUT_REPO_FILES="threat-model.md threat-model.yaml …"
-      names or globs, matched in the output directory; a --console-log file is
-      published too, wherever it lies
+      names or globs, matched in the output directory
   OUTPUT_GIT_TOKEN=…  OUTPUT_GIT_TOKEN_FILE=<chmod 600>  OUTPUT_GIT_USER=oauth2
   OUTPUT_GIT_NAME=appsec-advisor   OUTPUT_GIT_EMAIL=appsec-advisor@localhost
       write credentials and commit identity for the report repository; kept
@@ -332,9 +393,13 @@ Plugin and scan:
   VERBOSITY=quiet|normal|verbose                   (same as --quiet / --verbose)
   SCAN_MODE=standard|rebuild|rerender             (same as --mode)
   ASSUME_YES=1                                    (same as --yes)
-  CONSOLE_LOG=<file>                              (same as --console-log)
+  SAVE_CONSOLE_LOG=1                              (same as --console-log)
   WITH_SARIF=1  WITH_THREATDRAGON=1  WITH_REQUIREMENTS=1  RUN_QA=0
   WITH_PDF=1  WITH_HTML=1   (pdf needs pandoc + weasyprint on the machine)
+  SAVE_RUNTIME_FILES=1                            (same as --save-runtime-files)
+  RUNTIME_FILES=".hook-events.log .agent-run.log .skill-config.json"
+      which intermediates may be published; each is scanned for secrets first,
+      and every other intermediate stays in the output directory
   PENTEST_URL=<http(s) url>         (same as --url) Strix pentest tasks for that URL
   FAIL_ON=critical|high|medium      MAX_DURATION=<seconds>   MAX_BUDGET=<usd>
 
@@ -344,6 +409,8 @@ Service key (the key value never belongs in this file, only its source):
           auto takes the first configured source, in this order:
           cmd, aws, file, env — name a source explicitly to override it
   VERIFY_AUTH=auto|1|0     one tiny request that proves the credential is accepted
+  VERIFY_PUSH=1|0          probe whether the output repository accepts a push,
+                           before the scan rather than after it
 
   aws     AWS_SECRET_ID=<name|arn>  AWS_SECRET_FIELD=<json field, optional>
           region and credentials come from the AWS CLI (AWS_REGION, AWS_PROFILE, SSO,
@@ -367,9 +434,11 @@ while [ $# -gt 0 ]; do
         --context)     CONTEXT_SRC="${2:?--context needs a URL or a file path}"; shift 2 ;;
         --url)         PENTEST_URL="${2:?--url needs an http(s) URL}"; shift 2 ;;
         --output-repo) OUTPUT_REPO="${2:?--output-repo needs a git URL}"; shift 2 ;;
+        --create-output-repo) OUTPUT_REPO_CREATE=1; shift ;;
         --mode)        SCAN_MODE="${2:?--mode needs standard, rebuild or rerender}"; MODE_EXPLICIT=1; shift 2 ;;
         --max-budget)  MAX_BUDGET="${2:?--max-budget needs an amount in USD}"; shift 2 ;;
-        --console-log) CONSOLE_LOG="${2:?--console-log needs a file path}"; shift 2 ;;
+        --console-log) SAVE_CONSOLE_LOG=1; shift ;;
+        --save-runtime-files) SAVE_RUNTIME_FILES=1; shift ;;
         -y|--yes)      ASSUME_YES=1; shift ;;
         --verbose)     VERBOSITY=verbose; shift ;;
         --quiet)       VERBOSITY=quiet;   shift ;;
@@ -386,16 +455,39 @@ done
 # From here on, both streams go to the terminal and into the file. The copy is
 # stripped of the colour codes the terminal gets: what reads it is grep and a CI
 # artifact viewer, not a terminal.
-if [ -n "$CONSOLE_LOG" ]; then
-    : >>"$CONSOLE_LOG" || die "cannot write the console log: $CONSOLE_LOG"
+#
+# Where it ends up is decided in step 4 — which directory that is depends on the
+# target, and the first steps have printed by then. So the run writes to a
+# temporary file throughout and save_console_log copies it into place: before
+# the report is published, and again when the script exits. The published copy
+# therefore ends where the publishing begins; the one in the output directory is
+# complete.
+CONSOLE_TMP=""
+CONSOLE_LOG=""
+save_console_log() {
+    [ -n "$CONSOLE_TMP" ] && [ -n "$CONSOLE_LOG" ] || return 0
+    cp -f "$CONSOLE_TMP" "$CONSOLE_LOG" 2>/dev/null || return 0
+}
+on_exit() {
+    save_console_log
+    if [ -n "$CONSOLE_TMP" ] && [ -z "$CONSOLE_LOG" ]; then
+        printf '      console log: %s\n' "$CONSOLE_TMP" >&2
+    else
+        [ -n "$CONSOLE_TMP" ] && rm -f "$CONSOLE_TMP"
+    fi
+}
+if [ "$SAVE_CONSOLE_LOG" = "1" ]; then
+    CONSOLE_TMP="$(mktemp)" || die "cannot create the console log"
+    trap on_exit EXIT
     exec > >(tee >(awk -v e="$(printf '\033')" \
-        '{ gsub(e "\\[[0-9;]*m", ""); print; fflush() }' >>"$CONSOLE_LOG")) 2>&1
+        '{ gsub(e "\\[[0-9;]*m", ""); print; fflush() }' >>"$CONSOLE_TMP")) 2>&1
 fi
 
 [ -n "$TARGET_DIR" ] || [ -n "$TARGET_REPO" ] || { usage >&2; die "give --target-dir or --target-repo"; }
 [ -n "$TARGET_DIR" ] && [ -n "$TARGET_REPO" ] && die "--target-dir and --target-repo are mutually exclusive"
 [ -z "$TARGET_REF" ] || [ -n "$TARGET_REPO" ] || die "--target-ref applies to --target-repo only"
 [ "$PROFILE_ONLY" = "0" ] || [ -z "$OUTPUT_REPO" ] || die "--profile-only produces no report, so there is nothing to publish to --output-repo"
+[ "$OUTPUT_REPO_CREATE" = "0" ] || [ -n "$OUTPUT_REPO" ] || die "--create-output-repo needs --output-repo — there is no repository named to create"
 
 case "$ADVISOR_SOURCE"   in official|local) ;; *) die "ADVISOR_SOURCE must be 'official' or 'local' (got: $ADVISOR_SOURCE)" ;; esac
 case "$TRUST_MODE"       in untrusted|trusted) ;; *) die "TRUST_MODE must be 'untrusted' or 'trusted' (got: $TRUST_MODE)" ;; esac
@@ -450,6 +542,7 @@ if [ -n "$OUTPUT_REPO" ]; then
         *[[:space:]]*) die "OUTPUT_REPO_PATH must not contain spaces (got: $OUTPUT_REPO_PATH)" ;;
     esac
     [ -n "$OUTPUT_REPO_FILES" ] || die "OUTPUT_REPO_FILES is empty — there would be nothing to publish"
+    case "$OUTPUT_REPO_HOST" in auto|github|gitlab) ;; *) die "OUTPUT_REPO_HOST must be auto, github or gitlab (got: $OUTPUT_REPO_HOST)" ;; esac
 fi
 
 if [ -n "$CONTEXT_SRC" ]; then
@@ -615,6 +708,7 @@ verify_auth() {
             *)       die "Anthropic rejected the service key from $1 — it may be revoked, belong to another organization, or have no credit left" ;;
         esac
     fi
+    AUTH_VERIFIED=1
     ok "credential accepted"
 }
 
@@ -643,6 +737,104 @@ git_auth() {  # git_auth <user> <token> <git arguments...>
 }
 git_target() { git_auth "$TARGET_GIT_USER" "$TARGET_GIT_TOKEN" "$@"; }
 git_output() { git_auth "$OUTPUT_GIT_USER" "$OUTPUT_GIT_TOKEN" "$@"; }
+
+# One request to a repository host's API, with the token in curl's config on
+# stdin so it stays out of the process list. Prints "<body>\n<http status>".
+host_api() {  # host_api <method> <url> <header name> <token> [<json body>]
+    local method="$1" url="$2" hdr="$3" token="$4" data="${5:-}" args=()
+    args=(--silent --show-error --location --max-time "$KEY_FETCH_TIMEOUT"
+          --request "$method" --write-out '\n%{http_code}'
+          --header 'Accept: application/json')
+    [ -n "$data" ] && args+=(--header 'Content-Type: application/json' --data "$data")
+    printf 'header = "%s: %s"\n' "$hdr" "$token" | curl "${args[@]}" --config - -- "$url"
+}
+
+# Pull one field out of a JSON response. python3 is a hard requirement of this
+# script anyway, and a grep over JSON is a bug waiting for a nested field.
+json_field() {  # json_field <field> <<< body
+    python3 -c 'import json,sys
+try: print((json.load(sys.stdin) or {}).get(sys.argv[1], "") or "")
+except Exception: print("")' "$1" 2>/dev/null
+}
+
+# Create the output repository on its host. Only reached with an explicit
+# --create-output-repo, and only when the repository is not there.
+create_output_repo() {  # create_output_repo <url>
+    local url="$1" host path owner name kind token api data out code body msg ns_id
+    command -v curl >/dev/null 2>&1 || die "creating a repository needs curl"
+    token="$OUTPUT_GIT_TOKEN"
+    [ -n "$token" ] || die "creating $url needs OUTPUT_GIT_TOKEN or OUTPUT_GIT_TOKEN_FILE — a repository is made through the host's API, not through git, and that is a wider permission than pushing"
+
+    case "$url" in
+        *://*)  host="${url#*://}"; host="${host#*@}"; path="${host#*/}"; host="${host%%/*}" ;;
+        *@*:*)  host="${url#*@}"; path="${host#*:}"; host="${host%%:*}" ;;
+        *)      die "cannot read a host out of the output repository URL: $url" ;;
+    esac
+    host="${host%%:*}"; path="${path#/}"; path="${path%.git}"; path="${path%/}"
+    owner="${path%/*}"; name="${path##*/}"
+    [ -n "$name" ] && [ -n "$owner" ] && [ "$owner" != "$path" ] \
+        || die "the output repository URL needs an owner and a name to create it: $url"
+
+    kind="$OUTPUT_REPO_HOST"
+    if [ "$kind" = "auto" ]; then
+        case "$host" in github.com) kind=github ;; *) kind=gitlab ;; esac
+        detail "creating on $host as a $kind host — OUTPUT_REPO_HOST overrides that"
+    fi
+
+    case "$kind" in
+        github)
+            # Whose namespace is it: the token's own user, or an organization?
+            out="$(host_api GET "https://api.github.com/user" Authorization "Bearer $token")"
+            code="${out##*$'\n'}"; body="${out%$'\n'*}"
+            [ "$code" = "200" ] || die "the GitHub token was not accepted (HTTP $code) — it needs repository creation rights"
+            if [ "$(printf '%s' "$body" | json_field login)" = "$owner" ]; then
+                api="https://api.github.com/user/repos"
+            else
+                api="https://api.github.com/orgs/$owner/repos"
+            fi
+            data="$(python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "private": True}))' "$name")"
+            out="$(host_api POST "$api" Authorization "Bearer $token" "$data")" ;;
+        gitlab)
+            # A group path is not an id, and the API wants the id. Nested groups
+            # resolve the same way, the whole path is one url-encoded segment.
+            api="https://$host/api/v4/namespaces/$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$owner")"
+            out="$(host_api GET "$api" PRIVATE-TOKEN "$token")"
+            code="${out##*$'\n'}"; body="${out%$'\n'*}"
+            case "$code" in
+                200) : ;;
+                401|403) die "the GitLab token was not accepted for $host (HTTP $code) — creating needs a token with the api scope" ;;
+                *) die "cannot find the namespace '$owner' on $host (HTTP $code) — create the group first, or check the URL" ;;
+            esac
+            ns_id="$(printf '%s' "$body" | json_field id)"
+            case "$ns_id" in
+                ''|*[!0-9]*) die "$host answered for the namespace '$owner' without an id — cannot create the project there" ;;
+            esac
+            data="$(python3 -c 'import json,sys; print(json.dumps({"path": sys.argv[1], "name": sys.argv[1], "namespace_id": int(sys.argv[2]), "visibility": "private", "initialize_with_readme": False}))' \
+                "$name" "$ns_id")"
+            out="$(host_api POST "https://$host/api/v4/projects" PRIVATE-TOKEN "$token" "$data")" ;;
+        *)  die "OUTPUT_REPO_HOST must be auto, github or gitlab (got: $kind)" ;;
+    esac
+
+    code="${out##*$'\n'}"; body="${out%$'\n'*}"
+    case "$code" in
+        200|201)
+            REMOTE_CREATED=1
+            ok "created $url as a private repository" ;;
+        # Someone else created it between the check and here. That is the state
+        # this was asked for, so it is not an error.
+        400|422)
+            case "$body" in
+                *"already exists"*|*"already been taken"*|*"has already been"*)
+                    warn "$url already existed after all — publishing into it" ;;
+                *)  msg="$(printf '%s' "$body" | json_field message)"
+                    die "the host refused to create $url (HTTP $code)${msg:+: $msg}" ;;
+            esac ;;
+        401|403) die "the token may not create repositories in '$owner' (HTTP $code) — pushing and creating are separate permissions" ;;
+        404)     die "the owner '$owner' does not exist on $host, or the token cannot see it (HTTP 404)" ;;
+        *)       msg="$(printf '%s' "$body" | json_field message)"
+                 die "creating $url failed (HTTP $code)${msg:+: $msg}" ;;
+    esac
+}
 
 # Is the remote there, and may we read it? Answered before a clone starts.
 check_remote_repo() {  # check_remote_repo <url> <description> [none|target|output] [allow-empty]
@@ -794,6 +986,7 @@ CLAUDE_EXECUTABLE="${APPSEC_CLAUDE_EXECUTABLE:-claude}"
 command -v git >/dev/null 2>&1 || die "git not found"
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
 ok "git $(git --version | awk '{print $3}'), python3 $(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')"
+pf_pass tools "git $(git --version | awk '{print $3}') · python3 $(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')"
 
 # The profile is a directory walk. It needs neither the CLI, nor the pipeline's
 # python packages, nor a credential — requiring them would keep the one mode
@@ -807,15 +1000,26 @@ else
     python3 -c 'import yaml, jsonschema' >/dev/null 2>&1 \
         || die "python3 is missing pyyaml/jsonschema — the pipeline needs both: python3 -m pip install pyyaml jsonschema"
     ok "claude $("$CLAUDE_EXECUTABLE" --version 2>/dev/null | head -1)"
+    pf_pass claude "$("$CLAUDE_EXECUTABLE" --version 2>/dev/null | head -1)"
+    pf_pass packages "pyyaml · jsonschema"
 
     resolve_auth
     if [ -n "$MAX_BUDGET" ] && [ "${KEY_SOURCE_EFFECTIVE:-none}" = "none" ]; then
         warn "a spend cap only limits API-billed runs; this one bills against the subscription, so \$$MAX_BUDGET is ignored"
     fi
+    AUTH_VERIFIED=0
     case "$VERIFY_AUTH" in
         1)    verify_auth "${KEY_ORIGIN:-the configured credential}" ;;
         auto) [ "${KEY_SOURCE_EFFECTIVE:-none}" != "none" ] && verify_auth "${KEY_ORIGIN:-the configured credential}" ;;
     esac
+    if [ "$AUTH_VERIFIED" = "1" ]; then
+        pf_pass credential "$AUTH_DESC · accepted by Anthropic"
+    else
+        # Not a finding: a subscription run is checked by the runner itself, and
+        # VERIFY_AUTH=0 is someone saying they know. Saying which it is beats a
+        # tick that claims more than was tested.
+        pf_pass credential "$AUTH_DESC · not tested here"
+    fi
 fi
 
 # The plugin fetches a context URL through its own URL policy, which rejects
@@ -839,7 +1043,7 @@ for info in infos:
         sys.exit(1)
 PY
         case "$ctx_rc" in
-            0) ok "context source reachable by name: $CONTEXT_SRC" ;;
+            0) ok "context source reachable by name: $CONTEXT_SRC"; pf_pass context "$CONTEXT_SRC · reachable" ;;
             1) warn "the context URL resolves to a private address — the plugin's URL policy rejects those; pass the document as a file instead" ;;
             2)  # Behind a proxy the name is resolved there, not here, so an
                 # unresolvable name says nothing about reachability.
@@ -851,7 +1055,7 @@ PY
             3) die  "--context URL has no host: $CONTEXT_SRC" ;;
         esac ;;
     "") : ;;
-    *)  ok "context file: $CONTEXT_SRC" ;;
+    *)  ok "context file: $CONTEXT_SRC"; pf_pass context "$CONTEXT_SRC" ;;
 esac
 
 mkdir -p "$CACHE_DIR" || die "cannot create cache directory: $CACHE_DIR"
@@ -956,6 +1160,7 @@ RUNNER="$PLUGIN_DIR/scripts/run-headless.sh"
 [ "$PROFILE_ONLY" = "1" ] || [ -x "$RUNNER" ] || [ -f "$RUNNER" ] || die "headless runner missing: $RUNNER"
 PLUGIN_NAME="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("name","?"))' "$PLUGIN_DIR/.claude-plugin/plugin.json" 2>/dev/null || echo '?')"
 ok "plugin '$PLUGIN_NAME' — $ADVISOR_VERSION"
+pf_pass plugin "$PLUGIN_NAME $ADVISOR_VERSION"
 detail "$PLUGIN_DIR"
 
 # ══════════════════════ 3. Provision the target ══════════════════════════════
@@ -1055,6 +1260,7 @@ step "Prepare output directory"
 mkdir -p "$OUTPUT_DIR" || die "cannot create output directory: $OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 LOG_FILE="$OUTPUT_DIR/run.log"
+[ "$SAVE_CONSOLE_LOG" = "1" ] && CONSOLE_LOG="$OUTPUT_DIR/console.log"
 
 case "$OUTPUT_DIR/" in
     "$TARGET"/docs/security/*|"$TARGET"/docs/security/) : ;;
@@ -1087,6 +1293,8 @@ if [ "$SCAN_MODE" = "rerender" ]; then
 fi
 
 ok "$OUTPUT_DIR"
+pf_pass target "$TARGET"
+pf_pass "output dir" "$OUTPUT_DIR"
 detail "log: $LOG_FILE"
 
 # GNU and BSD stat agree on nothing but the file they are asked about.
@@ -1142,7 +1350,7 @@ if [ "$PROFILE_ONLY" = "0" ] && [ "$MODE_EXPLICIT" = "0" ]; then
             if ask_choice \
                 "a run from ${prev_when:-an earlier day} finished its analysis but never rendered a report" \
                 "render that analysis, nothing is analyzed again" \
-                "rebuild from scratch; that finished analysis is discarded"; then
+                "r|rebuild" "rebuild from scratch; that finished analysis is discarded"; then
                 ok "rendering the finished analysis — nothing is analyzed again"
             else
                 SCAN_MODE="rebuild"
@@ -1159,7 +1367,7 @@ if [ "$PROFILE_ONLY" = "0" ] && [ "$MODE_EXPLICIT" = "0" ]; then
             if ask_choice \
                 "a report from ${prev_when:-an earlier run} is already here" \
                 "reassess and keep that report, its history and finding ids" \
-                "rebuild from scratch; history and finding ids are not kept" \
+                "r|rebuild" "rebuild from scratch; history and finding ids are not kept" \
                 "$residue_note"; then
                 SCAN_MODE="standard"; ok "reassessing — the previous report is kept"
             else
@@ -1191,14 +1399,63 @@ if [ -n "$OUTPUT_REPO" ]; then
     # after a scan that ran for twenty minutes helps nobody.
     validate_git_url "$OUTPUT_REPO"
     case "$OUTPUT_REPO" in
-        https://*) [ -n "$OUTPUT_GIT_TOKEN" ] || warn "no OUTPUT_GIT_TOKEN set — the push will only work if git already has write credentials for $OUTPUT_REPO" ;;
+        https://*) [ -n "$OUTPUT_GIT_TOKEN" ] || { warn "no OUTPUT_GIT_TOKEN set — the push will only work if git already has write credentials for $OUTPUT_REPO"
+                       pf_warn "repo token" "none set · the push relies on git's own credentials"; } ;;
     esac
+    # Ask first, create second: an existing repository — empty or not — is
+    # never touched, so the flag costs nothing on every run after the first.
+    if GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output ls-remote --quiet -- "$OUTPUT_REPO" HEAD >/dev/null 2>&1; then
+        [ "$OUTPUT_REPO_CREATE" = "1" ] && detail "the output repository is there already — nothing to create"
+    elif [ "$OUTPUT_REPO_CREATE" = "1" ]; then
+        info "the output repository did not answer — creating it"
+        create_output_repo "$OUTPUT_REPO"
+    elif interactive; then
+        # Over https a repository that is missing and one that is private look
+        # the same, so the question says what is known and not what it guesses.
+        # Saying no falls through to the check below, which names the reason.
+        if ask_choice \
+            "the output repository did not answer: $OUTPUT_REPO" \
+            "stop here — nothing is scanned, nothing is created" \
+            "c|create" "create it as a private repository and publish into it" \
+            "creating needs a token that may create repositories, which is more than pushing needs"; then
+            :
+        else
+            create_output_repo "$OUTPUT_REPO"
+        fi
+    fi
     check_remote_repo "$OUTPUT_REPO" "the output repository" output 1
     if [ -n "$OUTPUT_REPO_BRANCH" ]; then
+        [ "${REMOTE_CREATED:-0}" = "0" ] \
+            || die "a repository this run just created has no branches yet, so OUTPUT_REPO_BRANCH='$OUTPUT_REPO_BRANCH' cannot exist — leave it unset for the first publish, git names the branch on the first push"
         GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output ls-remote --exit-code --heads -- "$OUTPUT_REPO" "$OUTPUT_REPO_BRANCH" >/dev/null 2>&1 \
             || die "branch '$OUTPUT_REPO_BRANCH' does not exist in $OUTPUT_REPO — create it first, publishing does not open new branches"
     fi
+    # A read-only token passes ls-remote and fails the push: reading talks to
+    # upload-pack, writing to receive-pack, and the host refuses that one
+    # separately. The probe asks receive-pack for a deletion of a branch name
+    # that does not exist, as a dry run — the host answers the permission
+    # question at the connection, before any ref is looked at, and there is
+    # nothing here that could change the repository even without --dry-run.
+    if [ "$VERIFY_PUSH" = "1" ] && [ "$OUTPUT_REPO_PUSH" = "1" ]; then
+        probe_dir="$(mktemp -d)"; probe_out="$(mktemp)"
+        git init --quiet "$probe_dir"
+        GIT_TIMEOUT="$KEY_FETCH_TIMEOUT" git_output -C "$probe_dir" push --dry-run \
+            -- "$OUTPUT_REPO" ":refs/heads/appsec-advisor-write-probe" >"$probe_out" 2>&1 || :
+        probe_text="$(tr -d '\r' <"$probe_out" | tr '\n' ' ')"
+        rm -rf "$probe_dir" "$probe_out"
+        case "$probe_text" in
+            *403*|*"not authorized"*|*"Permission"*|*"permission"*|*"denied"*|*"read-only"*|*"not allowed to push"*)
+                die "the credentials for $OUTPUT_REPO may read it but not write to it — the token needs write access. Nothing has been scanned yet, so nothing is lost by fixing it now" ;;
+            *"[deleted]"*|*"remote ref does not exist"*|*"deletion of"*|*"unable to delete"*|"")
+                ok "the credentials may write to $OUTPUT_REPO"
+                pf_pass "repo access" "readable and writable" ;;
+            *)  # An unexpected answer says nothing either way, and a probe is no
+                # reason to stop a scan. The push has its own diagnostics.
+                warn "could not tell whether the credentials may write to $OUTPUT_REPO — the push will decide: $probe_text" ;;
+        esac
+    fi
     ok "report will be published to $OUTPUT_REPO in $OUTPUT_REPO_PATH/"
+    pf_pass "publish to" "$OUTPUT_REPO · $OUTPUT_REPO_PATH/"
     [ "${REMOTE_EMPTY:-0}" = "1" ] && detail "the repository is still empty — this run publishes the first report into it"
 fi
 
@@ -1234,6 +1491,8 @@ fi
 
 if [ "$PROFILE_ONLY" = "1" ]; then
     printf '\n'
+    preflight_summary
+    printf '\n'
     ok "profile only — no scan was started, nothing was billed"
     exit 0
 fi
@@ -1258,6 +1517,7 @@ if [ "$DISCARD_STAGE1" = "1" ]; then ARGS+=(--force); fi
 [ "$WITH_REQUIREMENTS" = "1" ]  && ARGS+=(--requirements)
 [ "$WITH_PDF" = "1" ]           && ARGS+=(--pdf)
 [ "$WITH_HTML" = "1" ]          && ARGS+=(--html)
+[ "$SAVE_RUNTIME_FILES" = "1" ] && ARGS+=(--keep-runtime-files)
 [ -n "$SESSION_MODEL" ]         && ARGS+=(--model "$SESSION_MODEL")
 [ -n "$REASONING_MODEL" ]       && ARGS+=(--reasoning-model "$REASONING_MODEL")
 [ -n "$MAX_DURATION" ]          && ARGS+=(--max-duration "$MAX_DURATION")
@@ -1272,8 +1532,18 @@ if [ -n "$CONTEXT_SRC" ]; then ARGS+=(--context "$CONTEXT_SRC"); else ARGS+=(--s
 [ "$VERBOSITY" = "verbose" ]    && ARGS+=(--verbose)
 ARGS+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
 
+preflight_summary
+printf '\n'
 info "mode=$SCAN_MODE depth=$ASSESSMENT_DEPTH trust=$TRUST_MODE qa=$([ "$RUN_QA" = 1 ] && echo on || echo off)${SESSION_MODEL:+ model=$SESSION_MODEL}${REASONING_MODEL:+ reasoning=$REASONING_MODEL}"
-detail "run-headless.sh ${ARGS[*]}"
+# What is about to run, in a form that can be pasted into a shell: the runner
+# resolves the rest itself, and a run that went wrong is then reproducible
+# without reconstructing it from the flags. %q quotes what needs quoting, so a
+# path with a space survives the copy. The credential is named, never printed.
+RUN_CMD="cd $(printf '%q' "$PLUGIN_DIR") && $(printf '%q ' sh "$RUNNER" "${ARGS[@]}")"
+RUN_CMD="${RUN_CMD% }"
+info "the command this runs:"
+detail "$RUN_CMD"
+detail "credential: $AUTH_DESC"
 printf '\n'
 
 {
@@ -1281,7 +1551,7 @@ printf '\n'
     printf 'plugin : %s (%s)\n' "$PLUGIN_DIR" "$ADVISOR_VERSION"
     printf 'target : %s\n' "$TARGET"
     printf 'auth   : %s\n' "$AUTH_DESC"
-    printf 'command: run-headless.sh %s\n\n' "${ARGS[*]}"
+    printf 'command: %s\n\n' "$RUN_CMD"
 } >>"$LOG_FILE"
 
 cd "$PLUGIN_DIR"
@@ -1344,6 +1614,7 @@ if [ -n "$OUTPUT_REPO" ]; then
     fi
     rm -f "$pub_err"
 
+    save_console_log
     PUB_DEST="$PUB_DIR/$OUTPUT_REPO_PATH"
     mkdir -p "$PUB_DEST"
     published=0
@@ -1359,14 +1630,31 @@ if [ -n "$OUTPUT_REPO" ]; then
             detail "staged $OUTPUT_REPO_PATH/$name"
         done
     done
-    # The console log lives wherever --console-log put it, which is usually not
-    # the output directory. It is still being written while this runs, so what
-    # is published ends at this line — the publish step itself is not in it.
-    if [ -n "$CONSOLE_LOG" ] && [ -f "$CONSOLE_LOG" ]; then
-        cp -f "$CONSOLE_LOG" "$PUB_DEST/${CONSOLE_LOG##*/}"
-        published=$((published + 1))
-        detail "staged $OUTPUT_REPO_PATH/${CONSOLE_LOG##*/}"
+    # The intermediates are raw excerpts of the scanned repository, and this
+    # publish path has no gate of its own — so each file goes through the
+    # plugin's own scanner first and a hit keeps it out. No scanner, nothing
+    # published: unchecked is not a state these files may travel in.
+    if [ "$SAVE_RUNTIME_FILES" = "1" ]; then
+        if [ ! -f "$PLUGIN_DIR/scripts/secret_scan.py" ]; then
+            warn "the provisioned appsec-advisor ($ADVISOR_VERSION) has no secret_scan.py — the runtime files stay out of $OUTPUT_REPO unchecked"
+        else
+            for pattern in $RUNTIME_FILES; do
+                for src in "$OUTPUT_DIR"/$pattern; do
+                    [ -f "$src" ] || continue
+                    name="${src##*/}"
+                    if ! python3 "$PLUGIN_DIR/scripts/secret_scan.py" "$src" >/dev/null 2>&1; then
+                        warn "$name reads like it carries an unmasked secret — not published (it stays in $OUTPUT_DIR)"
+                        continue
+                    fi
+                    mkdir -p "$PUB_DEST/runtime"
+                    cp -f "$src" "$PUB_DEST/runtime/$name"
+                    published=$((published + 1))
+                    detail "staged $OUTPUT_REPO_PATH/runtime/$name"
+                done
+            done
+        fi
     fi
+
     if [ "$published" -eq 0 ]; then
         # Say which of the two it is. An empty output repository is fine and
         # says nothing about this; what decides is whether the run produced a
