@@ -25,7 +25,7 @@ ASSESSMENT_DEPTH=thorough WITH_SARIF=1 FAIL_ON=high ./create-threat-model.sh --t
 
 The report lands in `./appsec-reports/<target-slug>/` unless `--output-dir` says otherwise: `threat-model.md` and `threat-model.yaml`, the SARIF, Threat Dragon, PDF and HTML variants where the run was asked for them, `pentest-tasks.yaml` when `--url` named a running instance, and `run.log`. That directory is git-ignored in this repository.
 
-A run with `--output-repo` works in `$TMPDIR/appsec-advisor/<target-slug>` instead and clears that directory first, so the current one stays clean and nothing piles up. Such a run starts from nothing: no earlier model, no changelog, new finding IDs. `--output-dir` and `OUTPUT_DIR_BASE` keep a stable directory, which is never cleared.
+A run with `--output-repo` works in `<cache>/staging/<target-slug>` instead (`APPSEC_ADVISOR_CACHE`, default `~/.cache/appsec-advisor`) and clears that directory first, so the current one stays clean and nothing piles up. Such a run starts from nothing: no earlier model, no changelog, new finding IDs. `--output-dir` and `OUTPUT_DIR_BASE` keep a stable directory, which is never cleared.
 
 `--help` lists the options, `--help config` every configuration variable.
 

@@ -365,9 +365,9 @@ Options:
   --target-repo <url>    Git repository to clone and scan (https://, ssh:// or git@)
   --target-ref  <ref>    Branch, tag or commit for --target-repo
   --output-dir  <dir>    Report directory (default: ./appsec-reports/<target-slug>,
-                         and with --output-repo a temporary directory that is
-                         cleared at the start of every run, because the report
-                         is then read from the repository)
+                         and with --output-repo a staging directory in the
+                         cache that is cleared at the start of every run,
+                         because the report is then read from the repository)
   --output-repo <url>    Publish the finished report into this git repository
   --create-output-repo   Create --output-repo on its host when it is not there,
                          without asking, and only once the report is finished —
@@ -436,6 +436,9 @@ the CONFIGURATION block at the top of the script.
 Plugin and scan:
   ADVISOR_SOURCE=official|local   ADVISOR_REF=latest|main|dev|<tag>|<sha>
   ADVISOR_LOCAL_PATH=<checkout|build-dir|.tgz>
+  APPSEC_ADVISOR_CACHE=<dir>  the plugin clone, the target clones and a
+      publishing run's staging directory. Default ~/.cache/appsec-advisor, or
+      ~/.cache/appsec-scan where a run under the old name left one
   GIT_TOKEN=…   GIT_TOKEN_FILE=<chmod 600>   GIT_USER=oauth2
       one credential for the target and the report repository, for when both
       live in the same place. TARGET_* and OUTPUT_* below win where they are set
@@ -445,7 +448,7 @@ Plugin and scan:
   OUTPUT_DIR_BASE=<dir>  parent of the report directory when --output-dir is
       omitted. Default ./appsec-reports, reused and overwritten by the next run
       of the same target. A run that publishes works in
-      $TMPDIR/appsec-advisor/<target-slug> instead, cleared without asking at
+      <cache>/staging/<target-slug> instead, cleared without asking at
       the start of every such run, so it starts from nothing every time: no
       earlier model, no changelog, new finding ids. Setting this, or
       --output-dir, brings a stable directory back
@@ -1647,7 +1650,7 @@ step "Prepare output directory"
 
 # Three cases, and the named path always wins:
 #   --output-dir            that directory
-#   --output-repo, no path  a fresh temporary directory per run
+#   --output-repo, no path  $CACHE_DIR/staging/<slug>, cleared first
 #   neither                 $OUTPUT_DIR_BASE/<slug>, reused and overwritten
 #
 # A run that publishes reads its report from the output repository, not from
@@ -1656,7 +1659,13 @@ step "Prepare output directory"
 # a few hundred intermediates into someone's working repository for no one's
 # benefit.
 #
-# One directory per target under the temp space, cleared at the start of every
+# It goes under the cache, not under $TMPDIR: that is where this launcher's
+# other run data already lives, it moves with APPSEC_ADVISOR_CACHE, it was
+# probed writable in the preflight, and a failed publish leaves a finished
+# report there that no tmp cleaner takes away while the push is being sorted
+# out.
+#
+# One directory per target under the cache, cleared at the start of every
 # publishing run: a per-run name would leave the intermediates of every run ever
 # started lying around, and asking whether the last one may go would be a
 # question about a directory the user never chose. What is cleared was published
@@ -1667,7 +1676,7 @@ step "Prepare output directory"
 OUTPUT_DIR_STAGING=0
 if [ -z "$OUTPUT_DIR" ]; then
     if [ -n "$OUTPUT_REPO" ] && [ "$OUTPUT_DIR_BASE_SET" = "0" ]; then
-        STAGING_BASE="${TMPDIR:-/tmp}/appsec-advisor"
+        STAGING_BASE="$CACHE_DIR/staging"
         OUTPUT_DIR="$STAGING_BASE/$SLUG"
         OUTPUT_DIR_STAGING=1
         # rm -rf on a computed path answers to the path, not to the intent that
@@ -1721,14 +1730,14 @@ if [ "$SCAN_MODE" = "rerender" ]; then
         # it is asked for lives somewhere the run cannot guess.
         rerender_hint="run --mode standard first"
         [ "$OUTPUT_DIR_STAGING" = "1" ] \
-            && rerender_hint="a publishing run clears its temporary directory first — point --output-dir at the earlier run's, or run --mode standard first"
+            && rerender_hint="a publishing run clears its staging directory first — point --output-dir at the earlier run's, or run --mode standard first"
         die "--mode rerender needs the assessment of an earlier run in $OUTPUT_DIR — missing: $rerender_missing; $rerender_hint"
     fi
 fi
 
 ok "$OUTPUT_DIR"
 if [ "$OUTPUT_DIR_STAGING" = "1" ]; then
-    detail "this run publishes, so the scan works in a temporary directory that every publishing run clears first — --output-dir or OUTPUT_DIR_BASE keeps it in a stable one"
+    detail "this run publishes, so the scan works in a staging directory under the cache that every publishing run clears first — --output-dir or OUTPUT_DIR_BASE keeps it in a stable one"
 fi
 pf_pass target "$TARGET"
 pf_pass "output dir" "$OUTPUT_DIR · writable"
@@ -2099,7 +2108,7 @@ if [ -n "$OUTPUT_REPO" ]; then
 
     KEEP_NOTE="the report is complete in $OUTPUT_DIR"
     [ "${OUTPUT_DIR_STAGING:-0}" = "1" ] \
-        && KEEP_NOTE="$KEEP_NOTE — a temporary directory the next publishing run of this target clears, so move it if you need it"
+        && KEEP_NOTE="$KEEP_NOTE — a staging directory the next publishing run of this target clears, so move it if you need it"
 
     PUB_DIR="$CACHE_DIR/publish/$SLUG"
     rm -rf "$PUB_DIR"; mkdir -p "$(dirname "$PUB_DIR")"
